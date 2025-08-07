@@ -18,7 +18,7 @@ from collections.abc import AsyncIterator, Awaitable
 from contextlib import asynccontextmanager
 from functools import partial
 from http import HTTPStatus
-from typing import Annotated, Any, Callable, Optional
+from typing import Annotated, Any, Callable, Optional, Union
 
 import prometheus_client
 import pydantic
