@@ -134,6 +134,78 @@ def as_embedding_model(cls: _T) -> _T:
 
     return ModelForEmbedding  # type: ignore
 
+def as_classification_model(cls: _T) -> _T:
+    """
+    Subclass an existing vLLM model to support classification.
+
+    By default, the class probabilities are extracted from the softmaxed
+    hidden state corresponding to the last token.
+
+    Note:
+        We assume that the classification head is a single linear layer
+        stored as the attribute `score` of the top-level model;
+        please implement your own model if this is not the case.
+    """
+    # Avoid modifying existing classification models
+    if is_pooling_model(cls):
+        return cls
+
+    # Lazy import
+    from vllm.config import VllmConfig
+    from vllm.model_executor.layers.linear import RowParallelLinear
+    from vllm.model_executor.layers.pooler import PoolingType
+    from vllm.sequence import IntermediateTensors
+
+    from .utils import maybe_prefix
+
+    ModelForPooling = _create_pooling_model_cls(
+        cls,
+        default_pooling_type=PoolingType.LAST,
+        default_normalize=False,
+        default_softmax=False,
+    )
+
+    class ModelForClassification(ModelForPooling):
+
+        def __init__(
+            self,
+            *,
+            vllm_config: "VllmConfig",
+            prefix: str = "",
+            **kwargs: Any,
+        ) -> None:
+            super().__init__(vllm_config=vllm_config, prefix=prefix, **kwargs)
+
+            config = vllm_config.model_config.hf_config
+            quant_config = vllm_config.quant_config
+
+            self.score = RowParallelLinear(config.hidden_size,
+                                           config.num_labels,
+                                           quant_config=quant_config,
+                                           input_is_parallel=False,
+                                           bias=False,
+                                           prefix=maybe_prefix(
+                                               prefix, "score"))
+
+        def forward(
+            self,
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
+            intermediate_tensors: Optional[IntermediateTensors] = None,
+            inputs_embeds: Optional[torch.Tensor] = None,
+        ) -> torch.Tensor:
+            hidden_states = super().forward(input_ids, positions,
+                                            intermediate_tensors,
+                                            inputs_embeds)
+            logits, _ = self.score(hidden_states)
+            return logits
+
+
+    ModelForClassification.__name__ = \
+        _get_pooling_model_name(cls.__name__, "ForClassification")
+
+    return ModelForClassification  # type: ignore
+
 
 def as_seq_cls_model(cls: _T) -> _T:
     """
