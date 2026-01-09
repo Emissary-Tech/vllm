@@ -48,6 +48,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead, VocabParallelEmbedding)
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
+from vllm.model_executor.models.debug_utils import (
+    is_debug_enabled, save_debug_output, increment_run_id)
 from vllm.model_executor.pooling_metadata import PoolingMetadata
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors, PoolerOutput
@@ -340,18 +342,30 @@ class Qwen2Model(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-        for layer in self.layers[self.start_layer:self.end_layer]:
+
+        # Debug: save embedding output
+        save_debug_output("embedding", hidden_states)
+
+        for i, layer in enumerate(self.layers[self.start_layer:self.end_layer]):
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 residual,
             )
+            # Debug: save each layer output
+            save_debug_output(f"layer_{self.start_layer + i}", hidden_states)
+            save_debug_output(f"layer_{self.start_layer + i}_residual", residual)
+
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
                 "hidden_states": hidden_states,
                 "residual": residual
             })
         hidden_states, _ = self.norm(hidden_states, residual)
+
+        # Debug: save final norm output
+        save_debug_output("final_norm", hidden_states)
+
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str,
