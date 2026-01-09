@@ -6,14 +6,29 @@ Enable with: VLLM_DEBUG_LAYERS=1
 
 import os
 import torch
+import json
+import tempfile
+from pathlib import Path
 from typing import Dict, Optional
 from collections import defaultdict
 
 # Global debug state
 VLLM_DEBUG = os.environ.get("VLLM_DEBUG_LAYERS", "0") == "1"
-VLLM_DEBUG_OUTPUTS: Dict[str, torch.Tensor] = {}
-VLLM_DEBUG_RUN_ID = 0
+VLLM_DEBUG_DIR = Path(tempfile.gettempdir()) / "vllm_debug"
 VLLM_DEBUG_MAX_RUNS = 5
+
+# Create debug directory if enabled
+if VLLM_DEBUG:
+    VLLM_DEBUG_DIR.mkdir(exist_ok=True)
+
+
+def _get_run_id_file() -> Path:
+    return VLLM_DEBUG_DIR / "run_id.txt"
+
+
+def _get_tensor_file(run_id: int, name: str) -> Path:
+    safe_name = name.replace("/", "_")
+    return VLLM_DEBUG_DIR / f"run_{run_id}_{safe_name}.pt"
 
 
 def is_debug_enabled() -> bool:
@@ -21,38 +36,60 @@ def is_debug_enabled() -> bool:
 
 
 def save_debug_output(name: str, tensor: torch.Tensor) -> None:
-    """Save tensor output for debugging."""
+    """Save tensor output for debugging to file."""
     if not VLLM_DEBUG:
         return
 
-    global VLLM_DEBUG_RUN_ID
-    key = f"run_{VLLM_DEBUG_RUN_ID}_{name}"
+    run_id = get_current_run_id()
+    tensor_file = _get_tensor_file(run_id, name)
     # Clone and convert to float32 for consistent comparison
-    VLLM_DEBUG_OUTPUTS[key] = tensor.detach().float().cpu().clone()
+    torch.save(tensor.detach().float().cpu().clone(), tensor_file)
 
 
 def increment_run_id() -> int:
     """Increment run ID after each forward pass."""
-    global VLLM_DEBUG_RUN_ID
-    VLLM_DEBUG_RUN_ID = (VLLM_DEBUG_RUN_ID + 1) % VLLM_DEBUG_MAX_RUNS
-    return VLLM_DEBUG_RUN_ID
-
-
-def reset_debug_state() -> None:
-    """Reset all debug state."""
-    global VLLM_DEBUG_RUN_ID, VLLM_DEBUG_OUTPUTS
-    VLLM_DEBUG_RUN_ID = 0
-    VLLM_DEBUG_OUTPUTS = {}
-
-
-def get_debug_outputs() -> Dict[str, torch.Tensor]:
-    """Get all captured outputs."""
-    return VLLM_DEBUG_OUTPUTS
+    current = get_current_run_id()
+    new_id = (current + 1) % VLLM_DEBUG_MAX_RUNS
+    _get_run_id_file().write_text(str(new_id))
+    return new_id
 
 
 def get_current_run_id() -> int:
     """Get current run ID."""
-    return VLLM_DEBUG_RUN_ID
+    run_id_file = _get_run_id_file()
+    if run_id_file.exists():
+        try:
+            return int(run_id_file.read_text().strip())
+        except:
+            return 0
+    return 0
+
+
+def reset_debug_state() -> None:
+    """Reset all debug state."""
+    if VLLM_DEBUG_DIR.exists():
+        for f in VLLM_DEBUG_DIR.glob("*.pt"):
+            f.unlink()
+        run_id_file = _get_run_id_file()
+        if run_id_file.exists():
+            run_id_file.unlink()
+
+
+def get_debug_outputs() -> Dict[str, torch.Tensor]:
+    """Get all captured outputs from files."""
+    outputs = {}
+    if not VLLM_DEBUG_DIR.exists():
+        return outputs
+
+    for f in VLLM_DEBUG_DIR.glob("run_*.pt"):
+        # Extract key from filename: run_0_layer_1.pt -> run_0_layer_1
+        key = f.stem
+        try:
+            outputs[key] = torch.load(f, weights_only=True)
+        except Exception as e:
+            print(f"Error loading {f}: {e}")
+
+    return outputs
 
 
 def compare_runs(run_id_1: int = 0, run_id_2: int = 1, threshold: float = 1e-6) -> Dict:
