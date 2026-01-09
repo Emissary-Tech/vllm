@@ -275,9 +275,7 @@ class LRUCache(cachetools.LRUCache[_K, _V], Generic[_K, _V]):
         return CacheInfo(hits=self._hits, total=self._total)
 
     def touch(self, key: _K) -> None:
-        # Simply accessing the key updates LRU order in cachetools
-        if key in self:
-            _ = self[key]
+        self._LRUCache__update(key)
 
     @overload
     def get(self, key: _K, /) -> Optional[_V]:
