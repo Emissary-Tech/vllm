@@ -98,6 +98,9 @@ def compare_runs(run_id_1: int = 0, run_id_2: int = 1, threshold: float = 1e-6) 
 
     Returns dict with comparison results for each layer.
     """
+    # Load all debug outputs from files
+    debug_outputs = get_debug_outputs()
+
     results = {}
 
     # Get all layer names from run 0
@@ -105,7 +108,7 @@ def compare_runs(run_id_1: int = 0, run_id_2: int = 1, threshold: float = 1e-6) 
     prefix_2 = f"run_{run_id_2}_"
 
     layer_names = set()
-    for key in VLLM_DEBUG_OUTPUTS.keys():
+    for key in debug_outputs.keys():
         if key.startswith(prefix_1):
             layer_names.add(key.replace(prefix_1, ""))
 
@@ -113,18 +116,18 @@ def compare_runs(run_id_1: int = 0, run_id_2: int = 1, threshold: float = 1e-6) 
         key_1 = f"{prefix_1}{layer_name}"
         key_2 = f"{prefix_2}{layer_name}"
 
-        if key_1 not in VLLM_DEBUG_OUTPUTS or key_2 not in VLLM_DEBUG_OUTPUTS:
+        if key_1 not in debug_outputs or key_2 not in debug_outputs:
             results[layer_name] = {"status": "missing", "details": "One of the runs missing this layer"}
             continue
 
-        tensor_1 = VLLM_DEBUG_OUTPUTS[key_1]
-        tensor_2 = VLLM_DEBUG_OUTPUTS[key_2]
+        tensor_1 = debug_outputs[key_1]
+        tensor_2 = debug_outputs[key_2]
 
         if tensor_1.shape != tensor_2.shape:
             results[layer_name] = {
                 "status": "shape_mismatch",
-                "shape_1": tensor_1.shape,
-                "shape_2": tensor_2.shape
+                "shape_1": list(tensor_1.shape),
+                "shape_2": list(tensor_2.shape)
             }
             continue
 
@@ -189,13 +192,16 @@ def print_comparison_report(run_id_1: int = 0, run_id_2: int = 1, threshold: flo
 
 def compare_all_runs(threshold: float = 1e-6) -> None:
     """Compare all captured runs against run 0."""
+    # Load all debug outputs from files
+    debug_outputs = get_debug_outputs()
+
     print("\n" + "="*80)
     print("Comparing all runs against Run 0")
     print("="*80)
 
     # Find all run IDs
     run_ids = set()
-    for key in VLLM_DEBUG_OUTPUTS.keys():
+    for key in debug_outputs.keys():
         parts = key.split("_")
         if len(parts) >= 2 and parts[0] == "run":
             try:
