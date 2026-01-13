@@ -12,6 +12,7 @@ import safetensors.torch
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.adapter_commons.models import (AdapterLRUCache, AdapterModel,
                                          AdapterModelManager)
 from vllm.adapter_commons.utils import (add_adapter, deactivate_adapter,
@@ -60,7 +61,13 @@ def get_lora_id():
 import torch
 from vllm.model_executor.models.adapters import as_classification_model
 
-def _replace_classification_head(base_model, num_labels, hidden_size, device, dtype=None):
+
+def _replace_classification_head(base_model,
+                                 num_labels,
+                                 hidden_size,
+                                 device,
+                                 dtype=None,
+                                 bias: bool = False):
     """
     Completely replace the classification head with a new one.
     
@@ -83,20 +90,25 @@ def _replace_classification_head(base_model, num_labels, hidden_size, device, dt
     
     # Import here to avoid circular imports
     from vllm.model_executor.layers.linear import RowParallelLinear
-    
-    # Create new classification head
-    new_head = RowParallelLinear(
-        hidden_size, 
-        num_labels, 
-        bias=True, 
-        prefix=""
-    ).to(device=device, dtype=dtype)
+
+    use_hf_linear = (envs.VLLM_USE_HF_CLASSIFICATION_HEAD
+                     or envs.VLLM_USE_HF_MODULES)
+    if use_hf_linear:
+        new_head = nn.Linear(hidden_size, num_labels, bias=bias).to(
+            device=device, dtype=dtype)
+    else:
+        new_head = RowParallelLinear(
+            hidden_size,
+            num_labels,
+            bias=bias,
+            prefix="",
+        ).to(device=device, dtype=dtype)
     
     # Initialize weights properly
     with torch.no_grad():
         # Use appropriate initialization based on model type
         torch.nn.init.normal_(new_head.weight, mean=0.0, std=0.02)
-        if hasattr(new_head, 'bias') and new_head.bias is not None:
+        if hasattr(new_head, "bias") and new_head.bias is not None:
             torch.nn.init.zeros_(new_head.bias)
     
     # Replace the head
@@ -156,11 +168,21 @@ def _attach_classification_head(base_model, tensors: dict):
         base_model.__class__ = as_classification_model(original_class)
         
         # Create new classification head
-        _replace_classification_head(base_model, num_labels, hidden_size, device, dtype)
+        _replace_classification_head(base_model,
+                                     num_labels,
+                                     hidden_size,
+                                     device,
+                                     dtype,
+                                     bias=bias_key is not None)
     else:
         # Always replace the classification head completely when switching adapters
         logger.info(f"Replacing existing classification head")
-        _replace_classification_head(base_model, num_labels, hidden_size, device, dtype)
+        _replace_classification_head(base_model,
+                                     num_labels,
+                                     hidden_size,
+                                     device,
+                                     dtype,
+                                     bias=bias_key is not None)
 
     # Load weights into the score layer
     with torch.no_grad():

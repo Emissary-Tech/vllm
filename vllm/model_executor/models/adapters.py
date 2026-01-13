@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Optional, TypeVar
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from .interfaces_base import VllmModelForPooling, is_pooling_model
 
 if TYPE_CHECKING:
@@ -189,13 +190,21 @@ def as_classification_model(cls: _T) -> _T:
             config = vllm_config.model_config.hf_config
             quant_config = vllm_config.quant_config
 
-            self.score = RowParallelLinear(config.hidden_size,
-                                           config.num_labels,
-                                           quant_config=quant_config,
-                                           input_is_parallel=False,
-                                           bias=False,
-                                           prefix=maybe_prefix(
-                                               prefix, "score"))
+            use_hf_linear = (envs.VLLM_USE_HF_CLASSIFICATION_HEAD
+                             or envs.VLLM_USE_HF_MODULES)
+            if use_hf_linear:
+                score_bias = bool(getattr(config, "score_bias", False))
+                self.score = nn.Linear(config.hidden_size,
+                                       config.num_labels,
+                                       bias=score_bias)
+            else:
+                self.score = RowParallelLinear(config.hidden_size,
+                                               config.num_labels,
+                                               quant_config=quant_config,
+                                               input_is_parallel=False,
+                                               bias=False,
+                                               prefix=maybe_prefix(
+                                                   prefix, "score"))
 
         def forward(
             self,
@@ -207,7 +216,10 @@ def as_classification_model(cls: _T) -> _T:
             hidden_states = super().forward(input_ids, positions,
                                             intermediate_tensors,
                                             inputs_embeds)
-            logits, _ = self.score(hidden_states)
+            if isinstance(self.score, RowParallelLinear):
+                logits, _ = self.score(hidden_states)
+            else:
+                logits = self.score(hidden_states)
             return logits
 
 

@@ -49,6 +49,34 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, WeightsMapper,
                     make_empty_intermediate_tensors_factory, maybe_prefix)
 
 logger = init_logger(__name__)
+_LOG_TENSOR_LAYOUT = envs.VLLM_LOG_TENSOR_LAYOUT
+_LOG_TENSOR_LAYOUT_LIMIT = max(envs.VLLM_LOG_TENSOR_LAYOUT_LIMIT, 0)
+_LOG_TENSOR_LAYOUT_CALLS = 0
+
+
+def _should_log_tensor_layout() -> bool:
+    global _LOG_TENSOR_LAYOUT_CALLS
+    if not _LOG_TENSOR_LAYOUT:
+        return False
+    if _LOG_TENSOR_LAYOUT_CALLS >= _LOG_TENSOR_LAYOUT_LIMIT:
+        return False
+    _LOG_TENSOR_LAYOUT_CALLS += 1
+    return True
+
+
+def _log_tensor_layout(tag: str, tensor: Optional[torch.Tensor]) -> None:
+    if tensor is None:
+        logger.info("Tensor layout %s: None", tag)
+        return
+    logger.info(
+        "Tensor layout %s shape=%s dtype=%s device=%s stride=%s contiguous=%s",
+        tag,
+        tuple(tensor.shape),
+        tensor.dtype,
+        tensor.device,
+        tuple(tensor.stride()),
+        tensor.is_contiguous(),
+    )
 
 
 def vllm_flash_attention_forward(
@@ -345,6 +373,12 @@ class TransformersModel(nn.Module):
         if inputs_embeds is not None:
             inputs_embeds = inputs_embeds[None, ...]
 
+        log_layout = _should_log_tensor_layout()
+        if log_layout:
+            _log_tensor_layout("transformers.input_ids", input_ids)
+            _log_tensor_layout("transformers.positions", positions)
+            _log_tensor_layout("transformers.inputs_embeds", inputs_embeds)
+
         model_kwargs = {
             "input_ids": input_ids,
             "inputs_embeds": inputs_embeds,
@@ -355,6 +389,8 @@ class TransformersModel(nn.Module):
         if self.attention_instances is not None:
             model_kwargs["attention_instances"] = self.attention_instances
         hidden_states = self.model(**model_kwargs)[0][0, ...]  # remove batch dim for now
+        if log_layout:
+            _log_tensor_layout("transformers.hidden_states", hidden_states)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
