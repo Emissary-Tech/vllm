@@ -52,6 +52,7 @@ logger = init_logger(__name__)
 _LOG_TENSOR_LAYOUT = envs.VLLM_LOG_TENSOR_LAYOUT
 _LOG_TENSOR_LAYOUT_LIMIT = max(envs.VLLM_LOG_TENSOR_LAYOUT_LIMIT, 0)
 _LOG_TENSOR_LAYOUT_CALLS = 0
+_LOG_ROTARY_DTYPE_DONE = False
 
 
 def _should_log_tensor_layout() -> bool:
@@ -77,6 +78,15 @@ def _log_tensor_layout(tag: str, tensor: Optional[torch.Tensor]) -> None:
         tuple(tensor.stride()),
         tensor.is_contiguous(),
     )
+
+
+def _maybe_log_rotary_dtype(name: str, buffer: torch.Tensor) -> None:
+    global _LOG_ROTARY_DTYPE_DONE
+    if _LOG_ROTARY_DTYPE_DONE or not _LOG_TENSOR_LAYOUT:
+        return
+    if "rotary" in name or "inv_freq" in name:
+        logger.info("Buffer dtype %s: %s", name, buffer.dtype)
+        _LOG_ROTARY_DTYPE_DONE = True
 
 
 def vllm_flash_attention_forward(
@@ -340,8 +350,17 @@ class TransformersModel(nn.Module):
         """
         for name, buffer in module.named_buffers(recurse=False):
             if buffer.device == torch.device("meta"):
-                new_buffer = getattr(type(module)(self.config), name)
+                if envs.VLLM_INIT_BUFFERS_FP32:
+                    orig_dtype = torch.get_default_dtype()
+                    torch.set_default_dtype(torch.float32)
+                    try:
+                        new_buffer = getattr(type(module)(self.config), name)
+                    finally:
+                        torch.set_default_dtype(orig_dtype)
+                else:
+                    new_buffer = getattr(type(module)(self.config), name)
                 setattr(module, name, new_buffer)
+                _maybe_log_rotary_dtype(name, new_buffer)
         for child in module.children():
             self.init_buffers(child)
 

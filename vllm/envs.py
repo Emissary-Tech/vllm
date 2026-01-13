@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     VLLM_SDPA_BACKEND: Optional[str] = None
     VLLM_LOG_TENSOR_LAYOUT: bool = False
     VLLM_LOG_TENSOR_LAYOUT_LIMIT: int = 1
+    VLLM_INIT_BUFFERS_FP32: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_USE_V1: bool = True
@@ -532,6 +533,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Limit the number of layout logs per process.
     "VLLM_LOG_TENSOR_LAYOUT_LIMIT":
     lambda: int(os.getenv("VLLM_LOG_TENSOR_LAYOUT_LIMIT", "1")),
+    # If set, initialize meta buffers (e.g. rotary inv_freq) as float32.
+    "VLLM_INIT_BUFFERS_FP32":
+    lambda: bool(int(os.getenv("VLLM_INIT_BUFFERS_FP32", "0"))),
 
     # By default, vLLM will check the peer-to-peer capability itself,
     # in case of broken drivers. See https://github.com/vllm-project/vllm/blob/a9b15c606fea67a072416ea0ea115261a2756058/vllm/distributed/device_communicators/custom_all_reduce_utils.py#L101-L108 for details. # noqa
