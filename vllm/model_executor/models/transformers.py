@@ -361,6 +361,8 @@ class TransformersModel(nn.Module):
                     new_buffer = getattr(type(module)(self.config), name)
                 setattr(module, name, new_buffer)
                 _maybe_log_rotary_dtype(name, new_buffer)
+            else:
+                _maybe_log_rotary_dtype(name, buffer)
         for child in module.children():
             self.init_buffers(child)
 
