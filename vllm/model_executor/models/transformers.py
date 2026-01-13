@@ -23,7 +23,6 @@ from torch import nn
 from transformers import AutoModel, PretrainedConfig, PreTrainedModel
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-import vllm.envs as envs
 from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (CacheConfig, DeviceConfig, ModelConfig,
@@ -48,45 +47,9 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, WeightsMapper,
                     is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, maybe_prefix)
 
+import vllm.envs as envs
+
 logger = init_logger(__name__)
-_LOG_TENSOR_LAYOUT = envs.VLLM_LOG_TENSOR_LAYOUT
-_LOG_TENSOR_LAYOUT_LIMIT = max(envs.VLLM_LOG_TENSOR_LAYOUT_LIMIT, 0)
-_LOG_TENSOR_LAYOUT_CALLS = 0
-_LOG_ROTARY_DTYPE_DONE = False
-
-
-def _should_log_tensor_layout() -> bool:
-    global _LOG_TENSOR_LAYOUT_CALLS
-    if not _LOG_TENSOR_LAYOUT:
-        return False
-    if _LOG_TENSOR_LAYOUT_CALLS >= _LOG_TENSOR_LAYOUT_LIMIT:
-        return False
-    _LOG_TENSOR_LAYOUT_CALLS += 1
-    return True
-
-
-def _log_tensor_layout(tag: str, tensor: Optional[torch.Tensor]) -> None:
-    if tensor is None:
-        logger.info("Tensor layout %s: None", tag)
-        return
-    logger.info(
-        "Tensor layout %s shape=%s dtype=%s device=%s stride=%s contiguous=%s",
-        tag,
-        tuple(tensor.shape),
-        tensor.dtype,
-        tensor.device,
-        tuple(tensor.stride()),
-        tensor.is_contiguous(),
-    )
-
-
-def _maybe_log_rotary_dtype(name: str, buffer: torch.Tensor) -> None:
-    global _LOG_ROTARY_DTYPE_DONE
-    if _LOG_ROTARY_DTYPE_DONE or not _LOG_TENSOR_LAYOUT:
-        return
-    if "rotary" in name or "inv_freq" in name:
-        logger.info("Buffer dtype %s: %s", name, buffer.dtype)
-        _LOG_ROTARY_DTYPE_DONE = True
 
 
 def vllm_flash_attention_forward(
@@ -350,19 +313,8 @@ class TransformersModel(nn.Module):
         """
         for name, buffer in module.named_buffers(recurse=False):
             if buffer.device == torch.device("meta"):
-                if envs.VLLM_INIT_BUFFERS_FP32:
-                    orig_dtype = torch.get_default_dtype()
-                    torch.set_default_dtype(torch.float32)
-                    try:
-                        new_buffer = getattr(type(module)(self.config), name)
-                    finally:
-                        torch.set_default_dtype(orig_dtype)
-                else:
-                    new_buffer = getattr(type(module)(self.config), name)
+                new_buffer = getattr(type(module)(self.config), name)
                 setattr(module, name, new_buffer)
-                _maybe_log_rotary_dtype(name, new_buffer)
-            else:
-                _maybe_log_rotary_dtype(name, buffer)
         for child in module.children():
             self.init_buffers(child)
 
@@ -394,12 +346,6 @@ class TransformersModel(nn.Module):
         if inputs_embeds is not None:
             inputs_embeds = inputs_embeds[None, ...]
 
-        log_layout = _should_log_tensor_layout()
-        if log_layout:
-            _log_tensor_layout("transformers.input_ids", input_ids)
-            _log_tensor_layout("transformers.positions", positions)
-            _log_tensor_layout("transformers.inputs_embeds", inputs_embeds)
-
         model_kwargs = {
             "input_ids": input_ids,
             "inputs_embeds": inputs_embeds,
@@ -410,8 +356,6 @@ class TransformersModel(nn.Module):
         if self.attention_instances is not None:
             model_kwargs["attention_instances"] = self.attention_instances
         hidden_states = self.model(**model_kwargs)[0][0, ...]  # remove batch dim for now
-        if log_layout:
-            _log_tensor_layout("transformers.hidden_states", hidden_states)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})

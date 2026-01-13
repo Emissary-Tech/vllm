@@ -32,47 +32,9 @@ _R = TypeVar("_R")
 
 pynvml = import_pynvml()
 
-# Determinism toggle (can be slow).
-if envs.VLLM_DETERMINISTIC:
-    if os.environ.get("CUBLAS_WORKSPACE_CONFIG") not in (":4096:8", ":16:8"):
-        logger.warning(
-            "VLLM_DETERMINISTIC=1 requires CUBLAS_WORKSPACE_CONFIG to be set "
-            "to ':4096:8' or ':16:8' before launch for full determinism.")
-    if os.environ.get("CUDA_LAUNCH_BLOCKING") != "1":
-        logger.warning(
-            "VLLM_DETERMINISTIC=1 works best with CUDA_LAUNCH_BLOCKING=1.")
-    torch.use_deterministic_algorithms(True)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    torch.set_float32_matmul_precision("highest")
-    for attr in ("allow_bf16_reduced_precision_reduction",
-                 "allow_fp16_reduced_precision_reduction"):
-        if hasattr(torch.backends.cuda.matmul, attr):
-            setattr(torch.backends.cuda.matmul, attr, False)
-
 # pytorch 2.5 uses cudnn sdpa by default, which will cause crash on some models
 # see https://github.com/huggingface/diffusers/issues/9704 for details
 torch.backends.cuda.enable_cudnn_sdp(False)
-
-# Optional SDPA backend selection for torch SDPA.
-_sdpa_backend = (envs.VLLM_SDPA_BACKEND or "").lower()
-if _sdpa_backend in ("math", "flash", "mem_efficient", "mem-efficient",
-                     "memefficient"):
-    torch.backends.cuda.enable_cudnn_sdp(False)
-    if _sdpa_backend == "math":
-        torch.backends.cuda.enable_math_sdp(True)
-        torch.backends.cuda.enable_flash_sdp(False)
-        torch.backends.cuda.enable_mem_efficient_sdp(False)
-    elif _sdpa_backend == "flash":
-        torch.backends.cuda.enable_math_sdp(False)
-        torch.backends.cuda.enable_flash_sdp(True)
-        torch.backends.cuda.enable_mem_efficient_sdp(False)
-    else:
-        torch.backends.cuda.enable_math_sdp(False)
-        torch.backends.cuda.enable_flash_sdp(False)
-        torch.backends.cuda.enable_mem_efficient_sdp(True)
 
 
 def device_id_to_physical_device_id(device_id: int) -> int:

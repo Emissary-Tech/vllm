@@ -73,11 +73,7 @@ if TYPE_CHECKING:
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_USE_HF_MODULES: bool = False
     VLLM_USE_HF_CLASSIFICATION_HEAD: bool = False
-    VLLM_DETERMINISTIC: bool = False
-    VLLM_SDPA_BACKEND: Optional[str] = None
-    VLLM_LOG_TENSOR_LAYOUT: bool = False
-    VLLM_LOG_TENSOR_LAYOUT_LIMIT: int = 1
-    VLLM_INIT_BUFFERS_FP32: bool = False
+    VLLM_HF_DIRECT_CLASSIFY: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_USE_V1: bool = True
@@ -521,21 +517,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, use torch.nn.Linear for classification heads.
     "VLLM_USE_HF_CLASSIFICATION_HEAD":
     lambda: bool(int(os.getenv("VLLM_USE_HF_CLASSIFICATION_HEAD", "0"))),
-    # If set, force deterministic torch/CUDA behavior (may be slower).
-    "VLLM_DETERMINISTIC":
-    lambda: bool(int(os.getenv("VLLM_DETERMINISTIC", "0"))),
-    # SDPA backend selection for torch SDPA: "math" | "flash" | "mem_efficient".
-    "VLLM_SDPA_BACKEND":
-    lambda: os.getenv("VLLM_SDPA_BACKEND"),
-    # If set, log tensor layout (shape/stride/contiguity) in transformers backend.
-    "VLLM_LOG_TENSOR_LAYOUT":
-    lambda: bool(int(os.getenv("VLLM_LOG_TENSOR_LAYOUT", "0"))),
-    # Limit the number of layout logs per process.
-    "VLLM_LOG_TENSOR_LAYOUT_LIMIT":
-    lambda: int(os.getenv("VLLM_LOG_TENSOR_LAYOUT_LIMIT", "1")),
-    # If set, initialize meta buffers (e.g. rotary inv_freq) as float32.
-    "VLLM_INIT_BUFFERS_FP32":
-    lambda: bool(int(os.getenv("VLLM_INIT_BUFFERS_FP32", "0"))),
+    "VLLM_HF_DIRECT_CLASSIFY":
+    lambda: bool(int(os.getenv("VLLM_HF_DIRECT_CLASSIFY", "0"))),
 
     # By default, vLLM will check the peer-to-peer capability itself,
     # in case of broken drivers. See https://github.com/vllm-project/vllm/blob/a9b15c606fea67a072416ea0ea115261a2756058/vllm/distributed/device_communicators/custom_all_reduce_utils.py#L101-L108 for details. # noqa
