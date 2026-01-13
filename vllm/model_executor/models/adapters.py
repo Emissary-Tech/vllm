@@ -7,7 +7,6 @@ import torch
 import torch.nn as nn
 
 from .interfaces_base import VllmModelForPooling, is_pooling_model
-from .debug_utils import save_debug_output, increment_run_id, is_debug_enabled
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.pooler import PoolingType
@@ -205,25 +204,10 @@ def as_classification_model(cls: _T) -> _T:
             intermediate_tensors: Optional[IntermediateTensors] = None,
             inputs_embeds: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
-            # Debug: save input_ids
-            save_debug_output("input_ids", input_ids.float())
-
             hidden_states = super().forward(input_ids, positions,
                                             intermediate_tensors,
                                             inputs_embeds)
-
-            # Debug: save hidden states before classification head
-            save_debug_output("pre_score_hidden", hidden_states)
-
             logits, _ = self.score(hidden_states)
-
-            # Debug: save final logits
-            save_debug_output("classification_logits", logits)
-
-            # Debug: increment run ID for next comparison
-            if is_debug_enabled():
-                increment_run_id()
-
             return logits
 
 

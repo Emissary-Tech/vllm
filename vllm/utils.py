@@ -275,7 +275,7 @@ class LRUCache(cachetools.LRUCache[_K, _V], Generic[_K, _V]):
         return CacheInfo(hits=self._hits, total=self._total)
 
     def touch(self, key: _K) -> None:
-        self._LRUCache__update(key)
+        self._LRUCache__update(key)  # type: ignore
 
     @overload
     def get(self, key: _K, /) -> Optional[_V]:

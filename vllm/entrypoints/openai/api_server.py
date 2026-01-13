@@ -401,62 +401,6 @@ async def health(raw_request: Request) -> Response:
     return Response(status_code=200)
 
 
-@router.get("/debug/layers")
-async def debug_layers() -> JSONResponse:
-    """Get debug layer comparison report."""
-    from vllm.model_executor.models.debug_utils import (
-        get_debug_outputs, compare_runs, is_debug_enabled, get_current_run_id
-    )
-
-    if not is_debug_enabled():
-        return JSONResponse(
-            content={"error": "Debug mode not enabled. Set VLLM_DEBUG_LAYERS=1"},
-            status_code=400
-        )
-
-    outputs = get_debug_outputs()
-    if not outputs:
-        return JSONResponse(
-            content={"message": "No debug outputs captured yet. Make some classification requests first."},
-            status_code=200
-        )
-
-    # Compare run 0 with run 1
-    comparison = compare_runs(0, 1, threshold=1e-6)
-
-    return JSONResponse(content={
-        "current_run_id": get_current_run_id(),
-        "captured_keys": list(outputs.keys()),
-        "comparison_0_vs_1": comparison
-    })
-
-
-@router.post("/debug/reset")
-async def debug_reset() -> JSONResponse:
-    """Reset debug state."""
-    from vllm.model_executor.models.debug_utils import reset_debug_state
-
-    reset_debug_state()
-    return JSONResponse(content={"message": "Debug state reset"})
-
-
-@router.get("/debug/compare/{run1}/{run2}")
-async def debug_compare(run1: int, run2: int) -> JSONResponse:
-    """Compare two specific runs."""
-    from vllm.model_executor.models.debug_utils import (
-        compare_runs, is_debug_enabled
-    )
-
-    if not is_debug_enabled():
-        return JSONResponse(
-            content={"error": "Debug mode not enabled. Set VLLM_DEBUG_LAYERS=1"},
-            status_code=400
-        )
-
-    comparison = compare_runs(run1, run2, threshold=1e-6)
-    return JSONResponse(content={"comparison": comparison})
-
-
 @router.get("/load")
 async def get_server_load_metrics(request: Request):
     # This endpoint returns the current server load metrics.

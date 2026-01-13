@@ -164,7 +164,7 @@ def _lora_shrink(
     BLOCK_M = 32
     BLOCK_N = 16
     BLOCK_K = 256 if M < 128 else 32
-    SPLIT_K = 64 if M < 128 else 8
+    SPLIT_K = 1
     NUM_WARPS = 4
     NUM_CTAS = 1
     NUM_STAGES = 2

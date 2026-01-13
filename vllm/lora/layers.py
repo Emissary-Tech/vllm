@@ -124,6 +124,7 @@ class BaseLayerWithLoRA(nn.Module):
         self.punica_wrapper: PunicaWrapperBase = punica_wrapper
 
     @classmethod
+    @_not_fully_sharded_can_replace
     def can_replace_layer(
         cls,
         source_layer: nn.Module,
@@ -491,6 +492,125 @@ class ReplicatedLinearWithLoRA(BaseLinearLayerWithLoRA):
         model_config: Optional[PretrainedConfig],
     ) -> bool:
         return type(source_layer) is ReplicatedLinear
+
+
+class TorchLinearWithLoRA(BaseLayerWithLoRA):
+    """LoRA wrapper for torch.nn.Linear."""
+
+    def __init__(self, base_layer: nn.Linear) -> None:
+        super().__init__()
+        self.base_layer = base_layer
+        self.input_size = self.base_layer.in_features
+        self.output_size = self.base_layer.out_features
+        self.n_slices = 1
+        self.tp_size = 1
+        self.device = _get_lora_device(self.base_layer)
+        self.lora_bias_stacked: Optional[Tuple[torch.Tensor, ...]] = None
+
+    def create_lora_weights(
+        self,
+        max_loras: int,
+        lora_config: LoRAConfig,
+        model_config: Optional[PretrainedConfig] = None,
+    ) -> None:
+        self.lora_config = lora_config
+        lora_a_out_size = lora_config.max_lora_rank
+        lora_b_out_size = self.output_size
+
+        self.lora_a_stacked = (
+            torch.zeros(
+                max_loras,
+                1,
+                lora_a_out_size,
+                self.input_size,
+                dtype=lora_config.lora_dtype,
+                device=self.device,
+            ),
+        )
+        self.lora_b_stacked = (
+            torch.zeros(
+                max_loras,
+                1,
+                lora_b_out_size,
+                lora_config.max_lora_rank,
+                dtype=lora_config.lora_dtype,
+                device=self.device,
+            ),
+        )
+        if lora_config.bias_enabled:
+            self.lora_bias_stacked = (
+                torch.zeros(
+                    max_loras,
+                    1,
+                    lora_b_out_size,
+                    dtype=lora_config.lora_dtype,
+                    device=self.device,
+                ),
+            )
+        self.output_slices = (self.lora_b_stacked[0].shape[2], )
+
+    def reset_lora(self, index: int):
+        self.lora_a_stacked[0][index] = 0
+        self.lora_b_stacked[0][index] = 0
+        if self.lora_config.bias_enabled:
+            self.lora_bias_stacked = cast(Tuple[torch.Tensor, ...],
+                                          self.lora_bias_stacked)
+            self.lora_bias_stacked[0][index] = 0
+
+    def set_lora(
+        self,
+        index: int,
+        lora_a: torch.Tensor,
+        lora_b: torch.Tensor,
+        embeddings_tensor: Optional[torch.Tensor],
+        lora_bias: Optional[torch.Tensor] = None,
+    ):
+        del embeddings_tensor
+        self.reset_lora(index)
+        self.lora_a_stacked[0][index,
+                               0, :lora_a.shape[1], :lora_a.shape[0]].copy_(
+                                   lora_a.T, non_blocking=True)
+        self.lora_b_stacked[0][index,
+                               0, :lora_b.shape[1], :lora_b.shape[0]].copy_(
+                                   lora_b.T, non_blocking=True)
+        if lora_bias is not None:
+            self.lora_bias_stacked = cast(Tuple[torch.Tensor, ...],
+                                          self.lora_bias_stacked)
+            self.lora_bias_stacked[0][index, 0, :lora_bias.shape[0]].copy_(
+                lora_bias.T, non_blocking=True)
+
+    def forward(self, input_: torch.Tensor) -> torch.Tensor:
+        output = F.linear(input_, self.base_layer.weight,
+                          self.base_layer.bias)
+        output_org = output
+        if input_.ndim == 3 and output.ndim == 3:
+            output = output.flatten(0, 1)
+            input_ = input_.flatten(0, 1)
+
+        self.punica_wrapper.add_lora_linear(output, input_,
+                                            self.lora_a_stacked,
+                                            self.lora_b_stacked,
+                                            self.lora_bias_stacked, 1.0,
+                                            self.output_slices)
+        return output_org
+
+    @classmethod
+    def can_replace_layer(
+        cls,
+        source_layer: nn.Module,
+        lora_config: LoRAConfig,
+        packed_modules_list: List,
+        model_config: Optional[PretrainedConfig],
+    ) -> bool:
+        return type(source_layer) is nn.Linear
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.base_layer.weight
+
+    @property
+    def bias(self) -> Optional[torch.Tensor]:
+        return self.base_layer.bias
 
 
 class ColumnParallelLinearWithLoRA(BaseLinearLayerWithLoRA):
