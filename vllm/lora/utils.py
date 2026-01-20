@@ -28,13 +28,11 @@ from vllm.lora.layers import (BaseLayerWithLoRA, ColumnParallelLinearWithLoRA,
                               QKVParallelLinearWithLoRA,
                               ReplicatedLinearWithLoRA,
                               RowParallelLinearWithLoRA,
-                              TorchLinearWithLoRA,
                               VocabParallelEmbeddingWithLoRA)
 from vllm.model_executor.layers.linear import LinearBase
 # yapf: enable
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.vocab_parallel_embedding import (
-    ParallelLMHead, VocabParallelEmbedding)
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.utils import WeightsMapper
 
 logger = init_logger(__name__)
@@ -47,7 +45,6 @@ _all_lora_classes: Set[Type[BaseLayerWithLoRA]] = {
     MergedQKVParallelLinearWithLoRA,
     RowParallelLinearWithLoRA,
     ReplicatedLinearWithLoRA,
-    TorchLinearWithLoRA,
     LogitsProcessorWithLoRA,
     ColumnParallelLinearWithShardedLoRA,
     QKVParallelLinearWithShardedLoRA,
@@ -189,10 +186,13 @@ def get_supported_lora_modules(model: nn.Module) -> List[str]:
     supported_lora_modules: Set[str] = set()
     # step1: traverse the model to get all the linear subfixes.
     for name, module in model.named_modules():
-        if isinstance(module, (LinearBase, nn.Linear)):
+        if isinstance(module, (LinearBase, )):
             supported_lora_modules.add(name.split(".")[-1])
-        if isinstance(module, VocabParallelEmbedding):
-            supported_lora_modules.add(name.split(".")[-1])
+    # step 2: get the embedding modules if the model's mbedding_modules
+    # is not empty.
+    if model.embedding_modules:
+        for name in model.embedding_modules:
+            supported_lora_modules.add(name)
     return list(supported_lora_modules)
 
 

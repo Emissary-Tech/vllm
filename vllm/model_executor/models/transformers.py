@@ -47,8 +47,6 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, WeightsMapper,
                     is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, maybe_prefix)
 
-import vllm.envs as envs
-
 logger = init_logger(__name__)
 
 
@@ -137,10 +135,6 @@ class TransformersModel(nn.Module):
         self.pp_size = self.pp_group.world_size
         self.pp_rank = self.pp_group.rank_in_group
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.attn_impl = getattr(config, "attn_implementation", None)
-        if self.attn_impl in (None, "auto"):
-            self.attn_impl = "vllm"
-        self.use_hf_modules = envs.VLLM_USE_HF_MODULES
 
         # Use meta device to delay allocating GPU tensors
         with torch.device("meta"):
@@ -149,24 +143,16 @@ class TransformersModel(nn.Module):
             # weights mapper to rename weights.
             self.model: PreTrainedModel = AutoModel.from_config(
                 config,
-                attn_implementation=self.attn_impl,
+                attn_implementation="vllm",
                 torch_dtype=model_config.dtype,
                 trust_remote_code=model_config.trust_remote_code,
             )
 
-        if self.use_hf_modules:
-            if self.tp_size > 1 or self.pp_size > 1:
-                raise ValueError(
-                    "VLLM_USE_HF_MODULES requires tensor_parallel_size=1 "
-                    "and pipeline_parallel_size=1.")
-        else:
-            self.pipeline_parallel()
-            self.tensor_parallel()
+        self.pipeline_parallel()
+        self.tensor_parallel()
 
         # Input embeddings
-        if (not self.use_hf_modules and
-                not isinstance(self.model.get_input_embeddings(),
-                               PPMissingLayer)):
+        if not isinstance(self.model.get_input_embeddings(), PPMissingLayer):
             self.model.set_input_embeddings(
                 VocabParallelEmbedding(
                     config.vocab_size,
@@ -176,8 +162,7 @@ class TransformersModel(nn.Module):
                 ))
 
         # Attention layers
-        self.attention_instances = (self.create_attention_instances()
-                                    if self.attn_impl == "vllm" else None)
+        self.attention_instances = self.create_attention_instances()
 
         # Initialize buffers (e.g. rotary embedding inverse frequency)
         self.init_buffers(self.model)
@@ -188,10 +173,6 @@ class TransformersModel(nn.Module):
         self.make_empty_intermediate_tensors = (
             make_empty_intermediate_tensors_factory(["hidden_states"],
                                                     config.hidden_size))
-
-        logger.info("Transformers backend attn_impl=%s", self.attn_impl)
-        if self.use_hf_modules:
-            logger.info("Transformers backend using HF modules only.")
 
     def pipeline_parallel(self):
         """
@@ -346,16 +327,13 @@ class TransformersModel(nn.Module):
         if inputs_embeds is not None:
             inputs_embeds = inputs_embeds[None, ...]
 
-        model_kwargs = {
-            "input_ids": input_ids,
-            "inputs_embeds": inputs_embeds,
-            "use_cache": False,
-            "position_ids": positions[None, ...],
-            "return_dict": False,
-        }
-        if self.attention_instances is not None:
-            model_kwargs["attention_instances"] = self.attention_instances
-        hidden_states = self.model(**model_kwargs)[0][0, ...]  # remove batch dim for now
+        hidden_states = self.model(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            use_cache=False,
+            position_ids=positions[None, ...],
+            attention_instances=self.attention_instances,
+            return_dict=False)[0][0, ...]  # we remove batch dimension for now
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
