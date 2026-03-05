@@ -488,6 +488,9 @@ class ModelConfig:
     `--generation-config vllm`, only the override parameters are used."""
     enable_sleep_mode: bool = False
     """Enable sleep mode for the engine (only cuda platform is supported)."""
+    return_hidden_states: bool = False
+    """Return hidden states (pre-lm_head) from the model for each request.
+    Used for classification via external score heads."""
     model_impl: Union[str, ModelImpl] = ModelImpl.AUTO.value
     """Which implementation of the model to use:\n
     - "auto" will try to use the vLLM implementation, if it exists, and fall

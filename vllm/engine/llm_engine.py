@@ -229,6 +229,9 @@ class LLMEngine:
         self.log_stats = log_stats
         self.use_cached_outputs = use_cached_outputs
 
+        # Hidden states cache for /v1/hidden_states endpoint
+        self._hidden_states_cache: Dict[str, list] = {}
+
         if self.model_config.skip_tokenizer_init:
             self.tokenizer = None
             self.detokenizer = None
@@ -854,6 +857,17 @@ class LLMEngine:
         outputs_by_sequence_group: List[List[SequenceGroupOutput]]
         assert not has_multiple_outputs
         outputs_by_sequence_group = outputs
+
+        # Cache hidden states if available (for /v1/hidden_states endpoint)
+        if (outputs and len(outputs) > 0
+                and isinstance(outputs[0], SamplerOutput)
+                and getattr(outputs[0], 'hidden_states', None) is not None):
+            sampler_output = outputs[0]
+            for i, seq_group_meta in enumerate(seq_group_metadata_list):
+                if i < sampler_output.hidden_states.shape[0]:
+                    self._hidden_states_cache[
+                        seq_group_meta.request_id
+                    ] = sampler_output.hidden_states[i].cpu().tolist()
 
         # Determine the requests we need to operate on
         if request_id:
@@ -1604,6 +1618,10 @@ class LLMEngine:
             max_lora=str(max_lora_stat),
             waiting_lora_adapters=list(waiting_lora_adapters.keys()),
             running_lora_adapters=list(running_lora_adapters.keys()))
+
+    def pop_hidden_states(self, request_id: str) -> Optional[list]:
+        """Pop cached hidden states for a request. Returns None if not found."""
+        return self._hidden_states_cache.pop(request_id, None)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_executor.add_lora(lora_request)

@@ -439,6 +439,7 @@ class EngineArgs:
 
     generation_config: str = ModelConfig.generation_config
     enable_sleep_mode: bool = ModelConfig.enable_sleep_mode
+    return_hidden_states: bool = ModelConfig.return_hidden_states
     override_generation_config: dict[str, Any] = \
         get_field(ModelConfig, "override_generation_config")
     model_impl: str = ModelConfig.model_impl
@@ -576,6 +577,8 @@ class EngineArgs:
                                  **model_kwargs["override_generation_config"])
         model_group.add_argument("--enable-sleep-mode",
                                  **model_kwargs["enable_sleep_mode"])
+        model_group.add_argument("--return-hidden-states",
+                                 **model_kwargs["return_hidden_states"])
         model_group.add_argument("--model-impl",
                                  choices=[f.value for f in ModelImpl],
                                  **model_kwargs["model_impl"])
@@ -1004,6 +1007,7 @@ class EngineArgs:
             generation_config=self.generation_config,
             override_generation_config=self.override_generation_config,
             enable_sleep_mode=self.enable_sleep_mode,
+            return_hidden_states=self.return_hidden_states,
             model_impl=self.model_impl,
             override_attention_dtype=self.override_attention_dtype,
             logits_processors=self.logits_processors,

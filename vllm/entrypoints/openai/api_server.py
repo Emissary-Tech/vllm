@@ -39,6 +39,7 @@ from typing_extensions import assert_never
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.sampling_params import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine  # type: ignore
 from vllm.engine.multiprocessing.client import MQLLMEngineClient
@@ -1124,6 +1125,91 @@ if envs.VLLM_SERVER_DEV_MODE:
             else:
                 response.append(str(result))
         return JSONResponse(content={"results": response})
+
+
+# --- Hidden states & lm_head weights endpoints (emissary-vllm) ---
+# These require V0 mode (VLLM_USE_V1=0) with --disable-frontend-multiprocessing
+# so that engine_client is an AsyncLLMEngine instance.
+
+
+@router.post("/v1/lm_head_weights")
+async def get_lm_head_weights(raw_request: Request):
+    """Extract lm_head weight rows for given token IDs.
+
+    Used by tool_server to build a local classification score head
+    from the model's output embedding weights.
+
+    Request body: {"token_ids": [65, 66, ...]}
+    Response: {"weights": [[...], [...], ...]}  # shape: [len(token_ids), hidden_dim]
+    """
+    client = engine_client(raw_request)
+    if not isinstance(client, AsyncLLMEngine):
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_IMPLEMENTED.value,
+            detail="/v1/lm_head_weights requires V0 mode "
+            "(VLLM_USE_V1=0) with --disable-frontend-multiprocessing")
+
+    try:
+        body = await raw_request.json()
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value,
+                            detail=f"JSON decode error: {e}") from e
+
+    token_ids = body.get("token_ids")
+    if token_ids is None or not isinstance(token_ids, list):
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value,
+                            detail="Missing or invalid 'token_ids' in request")
+
+    results = await client.apply_model(
+        lambda model: model.lm_head.weight.data[token_ids].cpu().tolist())
+    return JSONResponse(content={"weights": results[0]})
+
+
+@router.post("/v1/hidden_states")
+async def get_hidden_states(raw_request: Request):
+    """Get the last-token hidden state (pre-lm_head) for a prompt.
+
+    Runs a single-token generation through vLLM's full pipeline
+    (scheduler, PagedAttention, batching) and returns the cached
+    hidden states from the forward pass.
+
+    Request body: {"prompt": "..."}  # raw text (already chat-templated)
+    Response: {"hidden_states": [...]}  # shape: [hidden_dim]
+    """
+    client = engine_client(raw_request)
+    if not isinstance(client, AsyncLLMEngine):
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_IMPLEMENTED.value,
+            detail="/v1/hidden_states requires V0 mode "
+            "(VLLM_USE_V1=0) with --disable-frontend-multiprocessing")
+
+    try:
+        body = await raw_request.json()
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value,
+                            detail=f"JSON decode error: {e}") from e
+
+    prompt = body.get("prompt")
+    if prompt is None or not isinstance(prompt, str):
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value,
+                            detail="Missing or invalid 'prompt' in request")
+
+    request_id = f"hs-{uuid.uuid4().hex}"
+    sampling_params = SamplingParams(max_tokens=1, temperature=0)
+
+    # Generate 1 token to trigger forward pass → hidden states cached
+    async for output in client.generate(prompt, sampling_params, request_id):
+        final_output = output  # noqa: F841
+
+    # Read cached hidden states
+    hidden_states = await client.get_hidden_states(request_id)
+    if hidden_states is None:
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+            detail="Hidden states not available. Ensure --return-hidden-states "
+            "is enabled.")
+
+    return JSONResponse(content={"hidden_states": hidden_states})
 
 
 @router.post("/scale_elastic_ep",

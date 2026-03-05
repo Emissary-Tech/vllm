@@ -82,6 +82,10 @@ class Worker(LocalOrDistributedWorkerBase):
                         "qwen3_next_mtp")) \
                     else {"return_hidden_states": True}
 
+        # Also enable hidden states if explicitly requested via config
+        if model_config.return_hidden_states:
+            speculative_args["return_hidden_states"] = True
+
         ModelRunnerClass: Type[GPUModelRunnerBase] = ModelRunner
         if self.model_config.is_encoder_decoder:
             ModelRunnerClass = EncoderDecoderModelRunner

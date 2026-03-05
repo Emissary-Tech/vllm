@@ -1025,6 +1025,14 @@ class AsyncLLMEngine(EngineClient):
     async def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.engine.add_lora(lora_request)
 
+    async def get_hidden_states(self, request_id: str):
+        """Pop cached hidden states for a completed request."""
+        return self.engine.pop_hidden_states(request_id)
+
+    async def apply_model(self, func):
+        """Run a function directly on the model inside each worker."""
+        return self.engine.model_executor.apply_model(func)
+
     async def collective_rpc(self,
                              method: str,
                              timeout: Optional[float] = None,
