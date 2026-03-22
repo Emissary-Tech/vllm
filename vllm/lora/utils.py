@@ -193,6 +193,44 @@ def parse_fine_tuned_lora_name(
     raise ValueError(f"{name} is unsupported LoRA weight")
 
 
+def parse_fine_tuned_classifier_name(
+    name: str,
+    weights_mapper: "WeightsMapper | None" = None,
+) -> tuple[str, str] | None:
+    """Parse modules_to_save tensors for sequence classification heads."""
+
+    if name.startswith("base_model.model."):
+        name = name.replace("base_model.model.", "")
+        name = weights_mapper._map_name(name) if weights_mapper else name
+        name = "base_model.model." + name
+    else:
+        name = weights_mapper._map_name(name) if weights_mapper else name
+
+    start_index = 2 if name.startswith("base_model.model.") else 0
+    parts = name.split(".")
+    if len(parts) < start_index + 2 or parts[-1] not in {"weight", "bias"}:
+        return None
+
+    if parts[-2] in {"lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B"}:
+        return None
+
+    candidate_indices = [
+        idx
+        for idx, part in enumerate(parts[start_index:-1], start=start_index)
+        if part in {"score", "classifier"}
+    ]
+    if not candidate_indices:
+        return None
+
+    module_index = candidate_indices[-1]
+    trailing_parts = parts[module_index + 1 : -1]
+    if trailing_parts and any(part not in {"modules_to_save", "default"} for part in trailing_parts):
+        return None
+
+    module_name = ".".join(parts[start_index : module_index + 1])
+    return module_name, parts[-1]
+
+
 def is_base_embedding_weights(name: str) -> bool:
     # hardcoded subfixes for input & output embedding weights
     embedding_suffixes = (

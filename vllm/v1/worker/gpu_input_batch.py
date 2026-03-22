@@ -444,6 +444,12 @@ class InputBatch:
             # No LoRA
             self.request_lora_mapping[req_index] = 0
 
+        if req_id in self.pooling_params:
+            pooling_params = self.pooling_params[req_id]
+            extra_kwargs = dict(pooling_params.extra_kwargs or {})
+            extra_kwargs["lora_int_id"] = int(self.request_lora_mapping[req_index])
+            pooling_params.extra_kwargs = extra_kwargs
+
         return req_index
 
     def update_req_spec_token_ids(

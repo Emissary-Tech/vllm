@@ -12,6 +12,7 @@ from torch import nn
 from vllm.config import VllmConfig
 from vllm.config.lora import LoRAConfig
 from vllm.logger import init_logger
+from vllm.lora.classification_head import DynamicClassificationHead
 from vllm.lora.layers import (
     BaseLayerWithLoRA,
     FusedMoE3DWithLoRA,
@@ -112,6 +113,9 @@ class LoRAModelManager:
         self._is_non_gated_moe = is_moe and self.model.is_non_gated_moe
         self._init_punica_wrapper(max_num_batched_tokens, vllm_config)
         self._create_lora_modules()
+        self.dynamic_classification_heads = (
+            self._create_dynamic_classification_heads()
+        )
 
         self.model.lora_manager = self
 
@@ -264,6 +268,12 @@ class LoRAModelManager:
                 module_lora.lora_b,
             )
 
+        if lora_model.classification_head is not None:
+            for classification_head in self.dynamic_classification_heads:
+                classification_head.set_adapter_head(
+                    lora_model.id, lora_model.classification_head
+                )
+
         return True
 
     def _deactivate_adapter(self, lora_id: int):
@@ -272,6 +282,8 @@ class LoRAModelManager:
             self.lora_index_to_id[index] = None
         except ValueError:
             pass
+        for classification_head in self.dynamic_classification_heads:
+            classification_head.remove_adapter_head(lora_id)
 
     def _add_adapter(self, lora: LoRAModel):
         self._create_merged_loras_inplace(lora)
@@ -314,6 +326,8 @@ class LoRAModelManager:
         self._registered_adapters.clear()
         self.lora_index_to_id = [None] * self.lora_slots
         self._active_adapters.clear()
+        for classification_head in self.dynamic_classification_heads:
+            classification_head.clear_adapter_heads()
 
     def _create_lora_modules(self):
         def _parent_module(module_name: str) -> str:
@@ -566,6 +580,73 @@ class LoRAModelManager:
                 return self.punica_wrapper_mapping[prefix]
 
         return None
+
+    def _create_dynamic_classification_heads(self) -> list[DynamicClassificationHead]:
+        if not self.is_pooling_model:
+            return []
+
+        from vllm.model_executor.layers.pooler.seqwise.heads import (
+            ClassifierPoolerHead,
+        )
+
+        classifier_heads = [
+            module
+            for module in self.model.modules()
+            if isinstance(module, ClassifierPoolerHead)
+            and isinstance(module.classifier, nn.Module)
+        ]
+        if not classifier_heads:
+            return []
+
+        wrappers_by_module_id: dict[int, DynamicClassificationHead] = {}
+        for pooler_head in classifier_heads:
+            classifier = pooler_head.classifier
+            assert classifier is not None
+            if isinstance(classifier, DynamicClassificationHead):
+                wrappers_by_module_id[id(classifier)] = classifier
+                continue
+
+            if not hasattr(classifier, "weight"):
+                logger.warning_once(
+                    "Skipping dynamic classification head support for %s because "
+                    "the classifier does not expose a weight tensor.",
+                    type(classifier).__name__,
+                )
+                continue
+
+            wrapper = wrappers_by_module_id.get(id(classifier))
+            if wrapper is None:
+                wrapper = DynamicClassificationHead(classifier)
+                wrappers_by_module_id[id(classifier)] = wrapper
+                self._replace_module_references(self.model, classifier, wrapper)
+            pooler_head.classifier = wrapper
+
+        return list(wrappers_by_module_id.values())
+
+    def _replace_module_references(
+        self,
+        root_module: nn.Module,
+        target_module: nn.Module,
+        replacement_module: nn.Module,
+        visited: set[int] | None = None,
+    ) -> None:
+        if visited is None:
+            visited = set()
+        module_id = id(root_module)
+        if module_id in visited:
+            return
+        visited.add(module_id)
+
+        for child_name, child_module in root_module.named_children():
+            if child_module is target_module:
+                setattr(root_module, child_name, replacement_module)
+            else:
+                self._replace_module_references(
+                    child_module,
+                    target_module,
+                    replacement_module,
+                    visited,
+                )
 
     def _register_packed_modules(self, module_full_name: str) -> None:
         parts = module_full_name.split(".")
