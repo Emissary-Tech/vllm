@@ -7,11 +7,13 @@ import safetensors
 import torch
 
 from vllm.logger import init_logger
+from vllm.lora.classification_head import AdapterClassificationHead
 from vllm.lora.lora_weights import LoRALayerWeights
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.utils import (
     get_lora_id,
     is_base_embedding_weights,
+    parse_fine_tuned_classifier_name,
     parse_fine_tuned_lora_name,
 )
 from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
@@ -29,6 +31,7 @@ class LoRAModel:
         lora_model_id: int,
         rank: int,
         loras: dict[str, LoRALayerWeights],
+        classification_head: AdapterClassificationHead | None = None,
     ) -> None:
         """
         Args:
@@ -44,6 +47,7 @@ class LoRAModel:
         )
         self.rank = rank
         self.loras: dict[str, LoRALayerWeights] = loras
+        self.classification_head = classification_head
 
     def clone(self, lora_model_id: int) -> "LoRAModel":
         """Return a copy of the object with different ids.
@@ -53,6 +57,11 @@ class LoRAModel:
             lora_model_id,
             rank=self.rank,
             loras=self.loras.copy(),
+            classification_head=(
+                None
+                if self.classification_head is None
+                else self.classification_head.clone()
+            ),
         )
 
     def get_lora(self, module_name: str) -> LoRALayerWeights | None:
@@ -85,11 +94,20 @@ class LoRAModel:
         """Create a LoRAModel from a dictionary of tensors."""
         pin_memory = str(device) == "cpu" and is_pin_memory_available()
         loras: dict[str, LoRALayerWeights] = {}
+        head_tensors: dict[tuple[str, str], torch.Tensor] = {}
         for tensor_name, tensor in tensors.items():
             if is_base_embedding_weights(tensor_name):
                 continue
             # Skip modules based on model-defined prefixes (e.g., MTP layers)
             if skip_prefixes and cls._should_skip_module(tensor_name, skip_prefixes):
+                continue
+            parsed_head = parse_fine_tuned_classifier_name(tensor_name, weights_mapper)
+            if parsed_head is not None:
+                module_name, param_name = parsed_head
+                head_tensor = tensor.to(device=device, dtype=dtype)
+                if pin_memory:
+                    head_tensor = head_tensor.pin_memory()
+                head_tensors[(module_name, param_name)] = head_tensor
                 continue
             module_name, is_lora_a = parse_fine_tuned_lora_name(
                 tensor_name, weights_mapper
@@ -118,7 +136,32 @@ class LoRAModel:
                 if pin_memory:
                     loras[module_name].lora_b = loras[module_name].lora_b.pin_memory()
 
-        return cls(lora_model_id, peft_helper.r, loras)
+        classification_head = None
+        if head_tensors:
+            module_names = {module_name for module_name, _ in head_tensors}
+            if len(module_names) != 1:
+                raise ValueError(
+                    "Only one classification head per adapter is supported, "
+                    f"but found {sorted(module_names)}."
+                )
+            module_name = next(iter(module_names))
+            weight = head_tensors.get((module_name, "weight"))
+            if weight is None:
+                raise ValueError(
+                    f"Classification head {module_name!r} is missing a weight tensor."
+                )
+            classification_head = AdapterClassificationHead(
+                module_name=module_name,
+                weight=weight,
+                bias=head_tensors.get((module_name, "bias")),
+            )
+
+        return cls(
+            lora_model_id,
+            peft_helper.r,
+            loras,
+            classification_head=classification_head,
+        )
 
     @classmethod
     def from_local_checkpoint(
@@ -163,6 +206,8 @@ class LoRAModel:
         def check_unexpected_modules(modules: dict):
             for lora_module in modules.keys():  # noqa
                 if is_base_embedding_weights(lora_module):
+                    continue
+                if parse_fine_tuned_classifier_name(lora_module, weights_mapper):
                     continue
                 # Handle PEFT file format where experts.base_layer is the
                 # gate_up_proj and experts is the down_proj

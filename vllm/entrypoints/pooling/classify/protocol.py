@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import time
-from typing import TypeAlias
+from typing import Literal, TypeAlias
 
 from pydantic import Field
 
@@ -22,8 +22,17 @@ from vllm.utils import random_uuid
 logger = init_logger(__name__)
 
 
+class LegacyClassifyRequestMixin(OpenAIBaseModel):
+    classification_type: Literal["multiclass", "multilabel"] | None = None
+    encoding_format: Literal["float", "base64"] = "float"
+    dimensions: int | None = None
+
+
 class ClassificationCompletionRequest(
-    PoolingBasicRequestMixin, CompletionRequestMixin, ClassifyRequestMixin
+    PoolingBasicRequestMixin,
+    CompletionRequestMixin,
+    ClassifyRequestMixin,
+    LegacyClassifyRequestMixin,
 ):
     def build_tok_params(self, model_config: ModelConfig) -> TokenizeParams:
         encoder_config = model_config.encoder_config or {}
@@ -41,12 +50,15 @@ class ClassificationCompletionRequest(
     def to_pooling_params(self):
         return PoolingParams(
             task="classify",
-            use_activation=self.use_activation,
+            use_activation=False if self.use_activation is None else self.use_activation,
         )
 
 
 class ClassificationChatRequest(
-    PoolingBasicRequestMixin, ChatRequestMixin, ClassifyRequestMixin
+    PoolingBasicRequestMixin,
+    ChatRequestMixin,
+    ClassifyRequestMixin,
+    LegacyClassifyRequestMixin,
 ):
     def build_tok_params(self, model_config: ModelConfig) -> TokenizeParams:
         encoder_config = model_config.encoder_config or {}
@@ -64,7 +76,7 @@ class ClassificationChatRequest(
     def to_pooling_params(self):
         return PoolingParams(
             task="classify",
-            use_activation=self.use_activation,
+            use_activation=False if self.use_activation is None else self.use_activation,
         )
 
 
@@ -75,14 +87,12 @@ ClassificationRequest: TypeAlias = (
 
 class ClassificationData(OpenAIBaseModel):
     index: int
-    label: str | None
-    probs: list[float]
-    num_classes: int
+    logits: list[float] | str
+    probabilities: list[float] = Field(default_factory=list)
 
 
 class ClassificationResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"classify-{random_uuid()}")
-    object: str = "list"
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
     data: list[ClassificationData]

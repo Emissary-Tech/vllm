@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import TypeAlias
+import base64
+from typing import Literal, TypeAlias
 
 import numpy as np
 from fastapi.responses import JSONResponse
@@ -12,7 +13,6 @@ from vllm.entrypoints.openai.engine.protocol import UsageInfo
 from vllm.entrypoints.pooling.base.serving import PoolingServing
 from vllm.entrypoints.pooling.typing import PoolingServeContext
 from vllm.logger import init_logger
-from vllm.outputs import ClassificationOutput
 from vllm.renderers import BaseRenderer
 
 from .io_processor import ClassifyIOProcessor
@@ -26,6 +26,18 @@ logger = init_logger(__name__)
 
 
 ClassificationServeContext: TypeAlias = PoolingServeContext[ClassificationRequest]
+
+
+def _get_logits_data(
+    pooled_data,
+    encoding_format: Literal["float", "base64"],
+) -> list[float] | str:
+    if encoding_format == "float":
+        return pooled_data.tolist()
+    if encoding_format == "base64":
+        logits_bytes = np.array(pooled_data, dtype="float32").tobytes()
+        return base64.b64encode(logits_bytes).decode("utf-8")
+    raise ValueError(f"Unsupported classify encoding_format: {encoding_format}")
 
 
 class ServingClassification(PoolingServing):
@@ -47,21 +59,16 @@ class ServingClassification(PoolingServing):
         self,
         ctx: ClassificationServeContext,
     ) -> JSONResponse:
-        id2label = getattr(self.model_config.hf_config, "id2label", {})
+        if ctx.request.dimensions is not None:
+            raise ValueError("dimensions is currently not supported")
+
         num_prompt_tokens = 0
         items: list[ClassificationData] = []
+        encoding_format = ctx.request.encoding_format
         for idx, final_res in enumerate(ctx.final_res_batch):
-            classify_res = ClassificationOutput.from_base(final_res.outputs)
-
-            probs = classify_res.probs
-            predicted_index = int(np.argmax(probs))
-            label = id2label.get(predicted_index)
-
             item = ClassificationData(
                 index=idx,
-                label=label,
-                probs=probs,
-                num_classes=len(probs),
+                logits=_get_logits_data(final_res.outputs.data, encoding_format),
             )
 
             items.append(item)
@@ -76,7 +83,7 @@ class ServingClassification(PoolingServing):
         response = ClassificationResponse(
             id=ctx.request_id,
             created=ctx.created_time,
-            model=ctx.model_name,
+            model=ctx.request.model or ctx.model_name,
             data=items,
             usage=usage,
         )

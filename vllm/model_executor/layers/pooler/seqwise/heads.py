@@ -133,7 +133,12 @@ class ClassifierPoolerHead(SequencePoolerHead):
             pooled_data = pooled_data.to(self.head_dtype)
 
         if self.classifier is not None:
-            logits = self.classifier(pooled_data)
+            if hasattr(self.classifier, "forward_with_pooling_metadata"):
+                logits = self.classifier.forward_with_pooling_metadata(
+                    pooled_data, pooling_metadata
+                )
+            else:
+                logits = self.classifier(pooled_data)
         else:
             logits = pooled_data
 
