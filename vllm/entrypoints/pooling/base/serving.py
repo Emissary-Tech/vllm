@@ -249,6 +249,7 @@ class PoolingServing:
         request = ctx.request
         if request.model in self.models.lora_requests:
             ctx.lora_request = self.models.lora_requests[request.model]
+            return None
 
         # Currently only support default modality specific loras
         # if we have exactly one lora matched on the request.
@@ -256,6 +257,7 @@ class PoolingServing:
             default_mm_lora = self._get_active_default_mm_loras(request)
             if default_mm_lora is not None:
                 ctx.lora_request = default_mm_lora
+                return None
 
         if self._is_model_supported(request.model):
             return None
