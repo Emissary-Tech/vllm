@@ -531,10 +531,23 @@ class LoRAModelManager:
             else:
                 parts = module_name.split(".")
                 replacements = self.packed_modules_mapping[parts[-1]]
+                num_slices = getattr(module, "n_slices", len(module.lora_a_stacked))
                 subloras: list[LoRALayerWeights | None] = []
-                for i, r in enumerate(replacements):
+                if len(replacements) != num_slices:
+                    logger.warning_once(
+                        "Packed LoRA dummy warmup for %s expects %d slices but "
+                        "mapping only defines %d replacements; using layer "
+                        "slice count for dummy adapter creation.",
+                        module_name,
+                        num_slices,
+                        len(replacements),
+                    )
+                for i in range(num_slices):
+                    replacement_name = (
+                        replacements[i] if i < len(replacements) else f"slice_{i}"
+                    )
                     lora = LoRALayerWeights.create_dummy_lora_weights(
-                        module_name + "." + r,
+                        module_name + "." + replacement_name,
                         module.lora_a_stacked[i].shape[-1],
                         module.lora_b_stacked[i].shape[-2],
                         rank,
