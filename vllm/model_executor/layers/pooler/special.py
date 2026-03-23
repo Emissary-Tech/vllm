@@ -95,7 +95,8 @@ class DispatchPooler(Pooler):
         outputs = list[torch.Tensor | None]()
         offset = 0
         for task, group in groupby(pooling_metadata.tasks):
-            if not (pooler := poolers_by_task.get(task)):
+            pooler = poolers_by_task[task] if task in poolers_by_task else None
+            if not pooler:
                 raise ValueError(
                     f"Unsupported task: {task!r} "
                     f"Supported tasks: {self.get_supported_tasks()}"
