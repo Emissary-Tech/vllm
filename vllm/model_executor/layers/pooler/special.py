@@ -4,6 +4,7 @@ from collections.abc import Mapping, Set
 from itertools import groupby
 
 import torch
+import torch.nn as nn
 
 from vllm.config import PoolerConfig
 from vllm.model_executor.layers.pooler import PoolingParamsUpdate
@@ -66,7 +67,10 @@ class DispatchPooler(Pooler):
                     f"Supported tasks: {pooler.get_supported_tasks()}"
                 )
 
-        self.poolers_by_task = poolers_by_task
+        # Keep task-specific poolers registered as child modules so downstream
+        # module traversal can discover classifier heads and wrap them for
+        # dynamic LoRA dispatch.
+        self.poolers_by_task = nn.ModuleDict(dict(poolers_by_task))
 
     def get_supported_tasks(self) -> Set[PoolingTask]:
         return set(self.poolers_by_task)
