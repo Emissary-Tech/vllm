@@ -390,6 +390,20 @@ class DefaultModelLoader(BaseModelLoader):
         # that have loaded weights tracking currently.
         if model_config.quantization is None and loaded_weights is not None:
             weights_not_loaded = weights_to_load - loaded_weights
+            if model_config.convert_type == "classify":
+                # `--convert classify` synthesizes a top-level score head even
+                # when the base checkpoint is still a causal LM. In that case
+                # the head is expected to stay uninitialized until runtime or
+                # be supplied by a LoRA adapter.
+                allowed_missing = {"score.weight", "score.bias"}
+                ignored_weights = weights_not_loaded & allowed_missing
+                if ignored_weights:
+                    logger.warning(
+                        "Ignoring missing classification head weights during "
+                        "checkpoint load: %s",
+                        sorted(ignored_weights),
+                    )
+                    weights_not_loaded -= ignored_weights
             if weights_not_loaded:
                 raise ValueError(
                     "Following weights were not initialized from "
