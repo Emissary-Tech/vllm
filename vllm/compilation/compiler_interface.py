@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
 import copy
+import importlib
 import os
 from collections.abc import Callable
 from contextlib import ExitStack
@@ -373,8 +374,12 @@ class InductorStandaloneAdaptor(CompilerInterface):
                 break
 
         if input_fake_mode is not None:
-            fake_mode_ctx: Any = patch(
-                "torch._inductor.standalone_compile.FakeTensorMode",
+            standalone_compile_module = importlib.import_module(
+                "torch._inductor.standalone_compile"
+            )
+            fake_mode_ctx = patch.object(
+                standalone_compile_module,
+                "FakeTensorMode",
                 lambda *a, **kw: input_fake_mode,
             )
         else:
