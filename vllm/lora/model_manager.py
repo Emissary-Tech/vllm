@@ -451,12 +451,11 @@ class LoRAModelManager:
                     ),
                 )
 
-            # In some models, especially multimodal ones, layers with the same
-            # name may have different types, such as nn.Linear and
-            # ReplicatedLinear. The nn.Linear layers cannot be replaced with
-            # LoRA layers, leading to assertion error. The following check
-            # aims to prevent this error
-            if self.supports_mm and not isinstance(new_module, BaseLayerWithLoRA):
+            # Some matched modules are structural containers rather than
+            # LoRA-replaceable layers (for example, pooling task dispatch
+            # submodules named "score"). Skip any replacement that does not
+            # produce a BaseLayerWithLoRA instance.
+            if not isinstance(new_module, BaseLayerWithLoRA):
                 continue
             self.register_module(module_name, new_module)
 
