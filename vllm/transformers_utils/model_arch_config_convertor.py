@@ -423,6 +423,13 @@ class LongCatFlashMTPModelArchConfigConvertor(ModelArchConfigConvertorBase):
         return getattr(self.hf_text_config, "num_nextn_predict_layers", 1)
 
 
+class Gemma4ModelArchConfigConvertor(ModelArchConfigConvertorBase):
+    def get_head_size(self) -> int:
+        head_dim = getattr(self.hf_text_config, "head_dim", 0)
+        global_head_dim = getattr(self.hf_text_config, "global_head_dim", 0)
+        return max(head_dim, global_head_dim) or super().get_head_size()
+
+
 # hf_config.model_type -> convertor class
 MODEL_ARCH_CONFIG_CONVERTORS = {
     "mamba": MambaModelArchConfigConvertor,
@@ -433,6 +440,8 @@ MODEL_ARCH_CONFIG_CONVERTORS = {
     "mpt": MPTModelArchConfigConvertor,
     "dbrx": DbrxModelArchConfigConvertor,
     "falcon": FalconModelArchConfigConvertor,
+    "gemma4": Gemma4ModelArchConfigConvertor,
+    "gemma4_text": Gemma4ModelArchConfigConvertor,
     "RefinedWeb": FalconModelArchConfigConvertor,
     "RefinedWebModel": FalconModelArchConfigConvertor,
     "nemotron-nas": NemotronNasModelArchConfigConvertor,
