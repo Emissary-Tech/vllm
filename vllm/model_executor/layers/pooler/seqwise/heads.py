@@ -115,7 +115,7 @@ class ClassifierPoolerHead(SequencePoolerHead):
         self.activation = activation
 
     def get_supported_tasks(self) -> Set[PoolingTask]:
-        return {"classify"}
+        return {"classify", "score"}
 
     def forward(
         self,
