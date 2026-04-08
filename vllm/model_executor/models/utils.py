@@ -251,6 +251,14 @@ class AutoWeightsLoader:
             for stat_name in ("running_mean", "running_var", "num_batches_tracked"):
                 child_params[stat_name] = module_state_dict[stat_name]
 
+        # Some HF models expose checkpointed buffers that participate in the
+        # forward pass but are not parameters, e.g. Gemma4 vision
+        # standardization tensors.
+        module_state_dict = module.state_dict()
+        for tensor_name in ("std_bias", "std_scale"):
+            if tensor_name in module_state_dict:
+                child_params[tensor_name] = module_state_dict[tensor_name]
+
     def _load_module(
         self,
         base_prefix: str,
