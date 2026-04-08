@@ -53,6 +53,13 @@ class DispatchPooler(Pooler):
                     pooler_config,
                     pooling=pooling,
                     classifier=classifier,
+                    act_fn="classify",
+                ),
+                "score": pooler_for_classify(
+                    pooler_config,
+                    pooling=pooling,
+                    classifier=classifier,
+                    act_fn="score",
                 ),
             }
         )
@@ -88,7 +95,7 @@ class DispatchPooler(Pooler):
         outputs = list[torch.Tensor | None]()
         offset = 0
         for task, group in groupby(pooling_metadata.tasks):
-            pooler = poolers_by_task.get(task, None)
+            pooler = poolers_by_task[task] if task in poolers_by_task else None  # noqa: SIM401
             if not pooler:
                 raise ValueError(
                     f"Unsupported task: {task!r} "
@@ -113,7 +120,7 @@ class DispatchPooler(Pooler):
 
 class IdentityPooler(Pooler):
     def get_supported_tasks(self) -> Set[PoolingTask]:
-        return {"plugin"}
+        return {"plugin", "score"}
 
     def forward(
         self,
