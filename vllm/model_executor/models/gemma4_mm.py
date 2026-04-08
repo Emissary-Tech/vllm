@@ -891,6 +891,22 @@ class Gemma4ForConditionalGeneration(
         # ---- Vision tower (shared by image and video) ----
         with self._mark_tower_model(vllm_config, {"image", "video"}):
             self.vision_tower = AutoModel.from_config(config=config.vision_config)
+            # Some Gemma4 checkpoints save vision standardization buffers even
+            # when the loaded config path omits `standardize=true`. Register
+            # the buffers defensively so multimodal checkpoints can load, and
+            # make the forward path consume them when present.
+            if not hasattr(self.vision_tower, "std_bias"):
+                self.vision_tower.register_buffer(
+                    "std_bias",
+                    torch.zeros(config.vision_config.hidden_size),
+                )
+            if not hasattr(self.vision_tower, "std_scale"):
+                self.vision_tower.register_buffer(
+                    "std_scale",
+                    torch.ones(config.vision_config.hidden_size),
+                )
+            self.vision_tower.config.standardize = True
+            config.vision_config.standardize = True
             self.embed_vision = Gemma4MultimodalEmbedder(
                 config.vision_config, config.text_config
             )
