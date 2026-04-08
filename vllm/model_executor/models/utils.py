@@ -233,8 +233,15 @@ class AutoWeightsLoader:
     ):
         """
         Add tensor names that are not in the model params that may be in the
-        safetensors, e.g., batch normalization stats.
+        safetensors, e.g., batch normalization stats and registered buffers.
         """
+        # Add persistent registered buffers.
+        # Non-persistent buffers are excluded, matching PyTorch state_dict().
+        non_persistent = getattr(module, "_non_persistent_buffers_set", set())
+        for buf_name, buf in module.named_buffers(recurse=False):
+            if buf_name not in child_params and buf_name not in non_persistent:
+                child_params[buf_name] = buf
+
         if isinstance(
             module,
             (
@@ -250,14 +257,6 @@ class AutoWeightsLoader:
             module_state_dict = module.state_dict()
             for stat_name in ("running_mean", "running_var", "num_batches_tracked"):
                 child_params[stat_name] = module_state_dict[stat_name]
-
-        # Some HF models expose checkpointed buffers that participate in the
-        # forward pass but are not parameters, e.g. Gemma4 vision
-        # standardization tensors.
-        module_state_dict = module.state_dict()
-        for tensor_name in ("std_bias", "std_scale"):
-            if tensor_name in module_state_dict:
-                child_params[tensor_name] = module_state_dict[tensor_name]
 
     def _load_module(
         self,
