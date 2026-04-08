@@ -38,6 +38,7 @@ from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions, VideoDummyOptions
 from vllm.inputs import MultiModalDataDict
 from vllm.logger import init_logger
+from vllm.lora.lora_weights import LoRALayerWeights
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
@@ -65,7 +66,12 @@ from vllm.multimodal.processing.processor import (
 from vllm.sequence import IntermediateTensors
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
-from .interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsPP
+from .interfaces import (
+    MultiModalEmbeddings,
+    SupportsLoRA,
+    SupportsMultiModal,
+    SupportsPP,
+)
 from .utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -848,7 +854,9 @@ class Gemma4MultimodalEmbedder(nn.Module):
     info=Gemma4ProcessingInfo,
     dummy_inputs=Gemma4DummyInputsBuilder,
 )
-class Gemma4ForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP):
+class Gemma4ForConditionalGeneration(
+    nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA
+):
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -1329,6 +1337,29 @@ class Gemma4ForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP):
             connector=["embed_vision", "embed_audio"],
             tower_model=["vision_tower", "audio_tower"],
         )
+
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        return self.language_model.get_expert_mapping()
+
+    def adjust_packed_loras_for_module(
+        self,
+        module_name: str,
+        new_module_names: list[str],
+        replacement_loras: list[LoRALayerWeights | None],
+    ) -> list[LoRALayerWeights | None]:
+        return self.language_model.adjust_packed_loras_for_module(
+            module_name,
+            new_module_names,
+            replacement_loras,
+        )
+
+    def get_num_mm_encoder_tokens(self, num_mm_tokens: int) -> int:
+        # Gemma4 towers emit one soft token per retained patch/frame/audio step
+        # after padding removal; the connector preserves that token count.
+        return num_mm_tokens
+
+    def get_num_mm_connector_tokens(self, num_encoder_tokens: int) -> int:
+        return num_encoder_tokens
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
