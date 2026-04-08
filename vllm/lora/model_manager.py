@@ -684,6 +684,17 @@ class LoRAModelManager:
                 if lora:
                     has_replacement = True
                     replaced_module.add(r)
+            adjust_packed_loras = getattr(
+                self.model,
+                "adjust_packed_loras_for_module",
+                None,
+            )
+            if callable(adjust_packed_loras):
+                replacement_loras = adjust_packed_loras(
+                    module_name,
+                    new_module_names,
+                    replacement_loras,
+                )
             if not has_replacement:
                 continue
             for i in range(len(replacement_loras)):

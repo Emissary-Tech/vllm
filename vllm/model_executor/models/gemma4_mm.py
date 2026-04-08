@@ -36,6 +36,7 @@ from transformers.models.gemma4.configuration_gemma4 import (
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions, VideoDummyOptions
 from vllm.logger import init_logger
+from vllm.lora.lora_weights import LoRALayerWeights
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
@@ -951,6 +952,18 @@ class Gemma4ForConditionalGeneration(
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.language_model.get_expert_mapping()
+
+    def adjust_packed_loras_for_module(
+        self,
+        module_name: str,
+        new_module_names: list[str],
+        replacement_loras: list[LoRALayerWeights | None],
+    ) -> list[LoRALayerWeights | None]:
+        return self.language_model.adjust_packed_loras_for_module(
+            module_name,
+            new_module_names,
+            replacement_loras,
+        )
 
     # ------------------------------------------------------------------ #
     # Input parsing

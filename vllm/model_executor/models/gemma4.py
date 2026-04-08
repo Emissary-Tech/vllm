@@ -35,6 +35,7 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.lora.lora_weights import LoRALayerWeights
 from vllm.model_executor.layers.activation import GeluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoE, GateLinear
@@ -1481,6 +1482,38 @@ class Gemma4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, MixtureOfExperts):
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
+
+    def adjust_packed_loras_for_module(
+        self,
+        module_name: str,
+        new_module_names: list[str],
+        replacement_loras: list[LoRALayerWeights | None],
+    ) -> list[LoRALayerWeights | None]:
+        if not module_name.endswith(".qkv_proj") or len(replacement_loras) != 3:
+            return replacement_loras
+
+        if not getattr(self.config, "attention_k_eq_v", False):
+            return replacement_loras
+
+        parts = module_name.split(".")
+        try:
+            layer_idx = int(parts[parts.index("layers") + 1])
+        except (ValueError, IndexError):
+            return replacement_loras
+
+        layer_types = getattr(self.config, "layer_types", None)
+        if not layer_types or layer_idx >= len(layer_types):
+            return replacement_loras
+
+        if (
+            layer_types[layer_idx] == "full_attention"
+            and replacement_loras[1] is not None
+            and replacement_loras[2] is None
+        ):
+            replacement_loras = list(replacement_loras)
+            replacement_loras[2] = replacement_loras[1]
+
+        return replacement_loras
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Checkpoint weight names use "language_model." prefix (from the
