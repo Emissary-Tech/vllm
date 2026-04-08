@@ -8,6 +8,7 @@ GENERATION_TASKS: tuple[GenerationTask, ...] = get_args(GenerationTask)
 PoolingTask = Literal[
     "embed",
     "classify",
+    "score",
     "token_embed",
     "token_classify",
     "plugin",
