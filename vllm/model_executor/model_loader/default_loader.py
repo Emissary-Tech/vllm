@@ -395,7 +395,12 @@ class DefaultModelLoader(BaseModelLoader):
                 # when the base checkpoint is still a causal LM. In that case
                 # the head is expected to stay uninitialized until runtime or
                 # be supplied by a LoRA adapter.
-                allowed_missing = {"score.weight", "score.bias"}
+                allowed_missing = {
+                    "score.weight",
+                    "score.bias",
+                    "language_model.score.weight",
+                    "language_model.score.bias",
+                }
                 ignored_weights = weights_not_loaded & allowed_missing
                 if ignored_weights:
                     logger.warning(
