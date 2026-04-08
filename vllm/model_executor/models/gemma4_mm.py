@@ -949,6 +949,9 @@ class Gemma4ForConditionalGeneration(
         self.num_shared_experts = self.language_model.num_shared_experts
         self.num_redundant_experts = self.language_model.num_redundant_experts
 
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        return self.language_model.get_expert_mapping()
+
     # ------------------------------------------------------------------ #
     # Input parsing
     # ------------------------------------------------------------------ #

@@ -1365,6 +1365,25 @@ class Gemma4Model(nn.Module):
 
         return loaded_params
 
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        num_experts = getattr(self.config, "num_experts", None) or 0
+        return [
+            (
+                "experts.w13_weight"
+                if proj_name in ["gate_proj", "up_proj"]
+                else "experts.w2_weight",
+                f"experts.{expert_id}.{proj_name}",
+                expert_id,
+                shard_id,
+            )
+            for expert_id in range(num_experts)
+            for shard_id, proj_name in [
+                ("w1", "gate_proj"),
+                ("w2", "down_proj"),
+                ("w3", "up_proj"),
+            ]
+        ]
+
 
 class Gemma4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, MixtureOfExperts):
     # Note: qkv_proj packing applies to non-k_eq_v layers (sliding
@@ -1459,6 +1478,9 @@ class Gemma4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, MixtureOfExperts):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        return self.model.get_expert_mapping()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Checkpoint weight names use "language_model." prefix (from the
