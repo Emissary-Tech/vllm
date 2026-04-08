@@ -227,7 +227,9 @@ def parse_fine_tuned_classifier_name(
 
     module_index = candidate_indices[-1]
     trailing_parts = parts[module_index + 1 : -1]
-    if trailing_parts and any(part not in {"modules_to_save", "default"} for part in trailing_parts):
+    if trailing_parts and any(
+        part not in {"modules_to_save", "default"} for part in trailing_parts
+    ):
         return None
 
     module_name = ".".join(parts[start_index : module_index + 1])

@@ -138,6 +138,8 @@ class DynamicClassificationHead(nn.Module):
         weight = getattr(self.base_head, "weight", None)
         if not isinstance(weight, torch.Tensor):
             raise ValueError(
-                f"Classification head {type(self.base_head).__name__} does not expose a weight tensor."
+                "Classification head "
+                f"{type(self.base_head).__name__} "
+                "does not expose a weight tensor."
             )
         return weight

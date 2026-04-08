@@ -50,7 +50,9 @@ class ClassificationCompletionRequest(
     def to_pooling_params(self):
         return PoolingParams(
             task="classify",
-            use_activation=False if self.use_activation is None else self.use_activation,
+            use_activation=(
+                False if self.use_activation is None else self.use_activation
+            ),
         )
 
 
@@ -76,7 +78,9 @@ class ClassificationChatRequest(
     def to_pooling_params(self):
         return PoolingParams(
             task="classify",
-            use_activation=False if self.use_activation is None else self.use_activation,
+            use_activation=(
+                False if self.use_activation is None else self.use_activation
+            ),
         )
 
 
