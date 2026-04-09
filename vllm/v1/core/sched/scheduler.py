@@ -78,6 +78,7 @@ class Scheduler(SchedulerInterface):
         self.vllm_config = vllm_config
         self.scheduler_config = vllm_config.scheduler_config
         self.cache_config = vllm_config.cache_config
+        self.pooling_no_kv = vllm_config.model_config.runner_type == "pooling"
         self.lora_config = vllm_config.lora_config
         self.kv_cache_config = kv_cache_config
         self.kv_events_config = vllm_config.kv_events_config
@@ -460,11 +461,14 @@ class Scheduler(SchedulerInterface):
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
-                    new_blocks = self.kv_cache_manager.allocate_slots(
-                        request,
-                        num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens,
-                    )
+                    if self.pooling_no_kv:
+                        new_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+                    else:
+                        new_blocks = self.kv_cache_manager.allocate_slots(
+                            request,
+                            num_new_tokens,
+                            num_lookahead_tokens=self.num_lookahead_tokens,
+                        )
 
                     if new_blocks is not None:
                         # The request can be scheduled.
@@ -609,12 +613,16 @@ class Scheduler(SchedulerInterface):
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     # Get locally-cached tokens.
-                    new_computed_blocks, num_new_local_computed_tokens = (
-                        self.kv_cache_manager.get_computed_blocks(request)
-                    )
+                    if self.pooling_no_kv:
+                        new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+                        num_new_local_computed_tokens = 0
+                    else:
+                        new_computed_blocks, num_new_local_computed_tokens = (
+                            self.kv_cache_manager.get_computed_blocks(request)
+                        )
 
                     # Get externally-cached tokens if using a KVConnector.
-                    if self.connector is not None:
+                    if self.connector is not None and not self.pooling_no_kv:
                         ext_tokens, load_kv_async = (
                             self.connector.get_num_new_matched_tokens(
                                 request, num_new_local_computed_tokens
@@ -731,6 +739,7 @@ class Scheduler(SchedulerInterface):
 
                 if (
                     self.scheduler_reserve_full_isl
+                    and not self.pooling_no_kv
                     and not self.kv_cache_manager.can_fit_full_sequence(
                         request,
                         num_new_computed_tokens=num_new_local_computed_tokens,
@@ -743,16 +752,19 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.free(request)
                     break
 
-                new_blocks = self.kv_cache_manager.allocate_slots(
-                    request,
-                    num_new_tokens,
-                    num_new_computed_tokens=num_new_local_computed_tokens,
-                    new_computed_blocks=new_computed_blocks,
-                    num_lookahead_tokens=effective_lookahead_tokens,
-                    num_external_computed_tokens=num_external_computed_tokens,
-                    delay_cache_blocks=load_kv_async,
-                    num_encoder_tokens=num_encoder_tokens,
-                )
+                if self.pooling_no_kv:
+                    new_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+                else:
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        num_new_tokens,
+                        num_new_computed_tokens=num_new_local_computed_tokens,
+                        new_computed_blocks=new_computed_blocks,
+                        num_lookahead_tokens=effective_lookahead_tokens,
+                        num_external_computed_tokens=num_external_computed_tokens,
+                        delay_cache_blocks=load_kv_async,
+                        num_encoder_tokens=num_encoder_tokens,
+                    )
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
@@ -767,7 +779,7 @@ class Scheduler(SchedulerInterface):
                 # if a load is needed. Note that
                 # This information is used to determine if a load is
                 # needed for this request.
-                if self.connector is not None:
+                if self.connector is not None and not self.pooling_no_kv:
                     self.connector.update_state_after_alloc(
                         request,
                         self.kv_cache_manager.get_blocks(request_id),
@@ -819,8 +831,10 @@ class Scheduler(SchedulerInterface):
 
                 if self.lora_config and request.lora_request:
                     scheduled_loras.add(request.lora_request.lora_int_id)
-                req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(
-                    request_id
+                req_to_new_blocks[request_id] = (
+                    self.kv_cache_manager.empty_kv_cache_blocks
+                    if self.pooling_no_kv
+                    else self.kv_cache_manager.get_blocks(request_id)
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
@@ -866,7 +880,7 @@ class Scheduler(SchedulerInterface):
         # This can be potentially used for cascade attention.
         num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
         with record_function_or_nullcontext("schedule: get_num_common_prefix_blocks"):
-            if self.running:
+            if self.running and not self.pooling_no_kv:
                 any_request_id = self.running[0].request_id
                 num_common_prefix_blocks = (
                     self.kv_cache_manager.get_num_common_prefix_blocks(any_request_id)
@@ -933,7 +947,7 @@ class Scheduler(SchedulerInterface):
         # 1. Plan the KV cache store
         # 2. Wrap up all the KV cache load / save ops into an opaque object
         # 3. Clear the internal states of the connector
-        if self.connector is not None:
+        if self.connector is not None and not self.pooling_no_kv:
             meta = self._build_kv_connector_meta(self.connector, scheduler_output)
             scheduler_output.kv_connector_metadata = meta
 
@@ -962,7 +976,8 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
-        self.kv_cache_manager.free(request)
+        if not self.pooling_no_kv:
+            self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
@@ -1600,7 +1615,10 @@ class Scheduler(SchedulerInterface):
         return False
 
     def _get_routed_experts(self, request: Request) -> np.ndarray | None:
-        if not self.vllm_config.model_config.enable_return_routed_experts:
+        if (
+            self.pooling_no_kv
+            or not self.vllm_config.model_config.enable_return_routed_experts
+        ):
             return None
 
         kv_blocks = self.kv_cache_manager.get_blocks(request.request_id)
@@ -1835,7 +1853,8 @@ class Scheduler(SchedulerInterface):
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
-        self.kv_cache_manager.free(request)
+        if not self.pooling_no_kv:
+            self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
 
     @property
@@ -2015,7 +2034,7 @@ class Scheduler(SchedulerInterface):
         Returns optional kv transfer parameters to be included with the
         request outputs.
         """
-        if self.connector is None:
+        if self.connector is None or self.pooling_no_kv:
             return False, None
 
         # Free any out-of-window prefix blocks before we hand the block table to
@@ -2119,7 +2138,7 @@ class Scheduler(SchedulerInterface):
             schedule the request during the next step.
         """
 
-        if self.connector is not None:
+        if self.connector is not None and not self.pooling_no_kv:
             self.connector.update_connector_output(kv_connector_output)
 
         # KV Connector:: update recv and send status from last step.

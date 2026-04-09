@@ -470,6 +470,16 @@ class TritonAttentionImpl(AttentionImpl):
                 layer,
             )
 
+        if attn_metadata.block_table.numel() == 0:
+            return self._forward_decoder_attention_no_kv(
+                query[:num_actual_tokens],
+                key[:num_actual_tokens],
+                value[:num_actual_tokens],
+                output[:num_actual_tokens],
+                attn_metadata,
+                layer,
+            )
+
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(1)
         if self.kv_cache_dtype.startswith("fp8"):
@@ -572,6 +582,35 @@ class TritonAttentionImpl(AttentionImpl):
         )
         return output
 
+    def _forward_decoder_attention_no_kv(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        layer: torch.nn.Module,
+    ) -> torch.Tensor:
+        if self.kv_cache_dtype.startswith("fp8"):
+            raise NotImplementedError(
+                "quantization is not supported for decoder no-KV attention"
+            )
+
+        context_attention_fwd(
+            q=query,
+            k=key,
+            v=value,
+            o=output,
+            b_start_loc=attn_metadata.query_start_loc,
+            b_seq_len=attn_metadata.seq_lens,
+            max_input_len=attn_metadata.max_query_len,
+            is_causal=attn_metadata.causal,
+            softmax_scale=self.scale,
+            sliding_window_q=self.sliding_window[0],
+            sliding_window_k=self.sliding_window[1],
+        )
+        return output
+
     def do_kv_cache_update(
         self,
         layer: AttentionLayer,
@@ -583,6 +622,8 @@ class TritonAttentionImpl(AttentionImpl):
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             # For encoder attention,
             # we use direct Q, K, V tensors without caching
+            return
+        if slot_mapping.numel() == 0:
             return
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(1)

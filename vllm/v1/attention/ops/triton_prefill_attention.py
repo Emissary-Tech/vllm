@@ -188,6 +188,21 @@ def get_block_size(dtype: torch.dtype) -> int:
         return 64
 
 
+def get_prefill_block_size(dtype: torch.dtype, head_dim: int) -> int:
+    block = get_block_size(dtype)
+    padded_head_dim = triton.next_power_of_2(head_dim)
+    if (
+        current_platform.is_cuda_alike()
+        and block > 64
+        and padded_head_dim >= 512
+    ):
+        # Large padded head dims can exceed SM80 shared-memory limits with the
+        # default 128x128 tile. Falling back to 64 preserves semantics while
+        # reducing per-kernel shared-memory pressure.
+        return 64
+    return block
+
+
 def context_attention_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -207,7 +222,7 @@ def context_attention_fwd(
     b_seq_len: [b]
     out: [b * s, head, head_dim]
     """
-    BLOCK = get_block_size(q.dtype)
+    BLOCK = get_prefill_block_size(q.dtype, k.shape[-1])
 
     Lq, Lk, _ = q.shape[-1], k.shape[-1], v.shape[-1]
 

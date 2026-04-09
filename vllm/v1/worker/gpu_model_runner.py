@@ -418,6 +418,7 @@ class GPUModelRunner(
         )
 
         self.is_pooling_model = model_config.runner_type == "pooling"
+        self.pooling_no_kv = self.is_pooling_model
         self.enable_prompt_embeds = model_config.enable_prompt_embeds
         self.is_multimodal_raw_input_only_model = (
             model_config.is_multimodal_raw_input_only_model
@@ -1799,9 +1800,10 @@ class GPUModelRunner(
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
 
-        # OPTIMIZATION: Start copying the block table first.
-        # This way, we can overlap the copy with the following CPU operations.
-        self.input_batch.block_table.commit_block_table(num_reqs)
+        if not self.pooling_no_kv:
+            # OPTIMIZATION: Start copying the block table first.
+            # This way, we can overlap the copy with the following CPU operations.
+            self.input_batch.block_table.commit_block_table(num_reqs)
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
@@ -2002,11 +2004,12 @@ class GPUModelRunner(
         )
         self.seq_lens[num_reqs:].fill_(0)
 
-        self.input_batch.block_table.compute_slot_mapping(
-            num_reqs,
-            self.query_start_loc.gpu[: num_reqs + 1],
-            self.positions[:total_num_scheduled_tokens],
-        )
+        if not self.pooling_no_kv:
+            self.input_batch.block_table.compute_slot_mapping(
+                num_reqs,
+                self.query_start_loc.gpu[: num_reqs + 1],
+                self.positions[:total_num_scheduled_tokens],
+            )
 
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
@@ -2134,6 +2137,12 @@ class GPUModelRunner(
 
         def _get_block_table(kv_cache_gid: int):
             assert num_reqs_padded is not None and num_tokens_padded is not None
+            if self.pooling_no_kv:
+                return torch.zeros(
+                    (num_reqs_padded, 0),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
             if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
                 blk_table_tensor = torch.zeros(
@@ -3722,6 +3731,15 @@ class GPUModelRunner(
             and len(self.kv_cache_config.kv_cache_groups) > 0
         ):
             return None, None
+
+        if self.pooling_no_kv:
+            slot_mappings_by_gid = {
+                gid: torch.empty((0,), dtype=torch.int64, device=self.device)
+                for gid, _ in enumerate(self.kv_cache_config.kv_cache_groups)
+            }
+            if ubatch_slices is not None:
+                return slot_mappings_by_gid, [{} for _ in ubatch_slices]
+            return slot_mappings_by_gid, {}
 
         def _get_slot_mapping(kv_cache_gid: int):
             assert num_reqs_padded is not None and num_tokens_padded is not None
@@ -5388,7 +5406,8 @@ class GPUModelRunner(
                 # remove_request() are visible to the attention metadata
                 # builder. Without this, stale block IDs from finished
                 # requests can corrupt Mamba state.
-                self.input_batch.block_table.commit_block_table(num_reqs_padded)
+                if not self.pooling_no_kv:
+                    self.input_batch.block_table.commit_block_table(num_reqs_padded)
 
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
                 attn_metadata, _ = self._build_attention_metadata(

@@ -693,6 +693,16 @@ class FlashAttentionImpl(AttentionImpl):
                 layer,
             )
 
+        if attn_metadata.block_table.numel() == 0:
+            return self._forward_decoder_attention_no_kv(
+                query[:num_actual_tokens],
+                key[:num_actual_tokens],
+                value[:num_actual_tokens],
+                output[:num_actual_tokens],
+                attn_metadata,
+                layer,
+            )
+
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(0)
 
@@ -803,6 +813,8 @@ class FlashAttentionImpl(AttentionImpl):
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             # For encoder attention,
             # we use direct Q, K, V tensors without caching
+            return
+        if slot_mapping.numel() == 0:
             return
 
         key_cache, value_cache = kv_cache.unbind(0)
@@ -978,6 +990,59 @@ class FlashAttentionImpl(AttentionImpl):
             v_descale=layer._v_scale.expand(descale_shape),
             num_splits=1 if self.batch_invariant_enabled else 0,
         )
+
+    def _forward_decoder_attention_no_kv(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        layer: torch.nn.Module,
+    ) -> torch.Tensor:
+        if self.vllm_flash_attn_version is None:
+            raise RuntimeError("FlashAttention version not detected.")
+        if self.kv_cache_dtype.startswith("fp8"):
+            raise NotImplementedError(
+                "quantization is not supported for decoder no-KV attention"
+            )
+        if self.dcp_world_size > 1:
+            raise NotImplementedError(
+                "decoder no-KV attention is not supported with decode context "
+                "parallelism"
+            )
+
+        cu_seqlens_q = attn_metadata.query_start_loc
+        max_seqlen_q = attn_metadata.max_query_len
+        descale_shape = (
+            cu_seqlens_q.shape[0] - 1,
+            self.num_kv_heads,
+        )
+        sliding_window_size = (
+            list(self.sliding_window) if self.sliding_window is not None else None
+        )
+        flash_attn_varlen_func(
+            q=query,
+            k=key,
+            v=value,
+            out=output,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_q,
+            softmax_scale=self.scale,
+            causal=attn_metadata.causal,
+            alibi_slopes=self.alibi_slopes,
+            window_size=sliding_window_size,
+            softcap=self.logits_soft_cap,
+            fa_version=self.vllm_flash_attn_version,
+            q_descale=layer._q_scale.expand(descale_shape),
+            k_descale=layer._k_scale.expand(descale_shape),
+            v_descale=layer._v_scale.expand(descale_shape),
+            num_splits=1 if self.batch_invariant_enabled else 0,
+            s_aux=self.sinks,
+        )
+        return output
 
         return output
 

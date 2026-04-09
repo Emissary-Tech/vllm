@@ -1103,6 +1103,39 @@ def get_kv_cache_config_from_groups(
             kv_cache_groups=kv_cache_groups,
         )
 
+    if vllm_config.model_config.runner_type == "pooling":
+        # Pooling/classification does not need persistent paged KV state.
+        # Keep the KV group structure for attention metadata/backend setup, but
+        # allocate only the null block so startup memory stays close to V0.
+        if len(kv_cache_groups) == 1 and isinstance(
+            kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
+        ):
+            per_layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
+            kv_cache_tensors = [
+                KVCacheTensor(size=per_layer_specs[layer_name].page_size_bytes, shared_by=[layer_name])
+                for layer_name in kv_cache_groups[0].layer_names
+            ]
+        else:
+            group_size = max(len(group.layer_names) for group in kv_cache_groups)
+            page_size = get_uniform_page_size(
+                [group.kv_cache_spec for group in kv_cache_groups]
+            )
+            kv_cache_tensors = []
+            for i in range(group_size):
+                shared_by = []
+                for j in range(len(kv_cache_groups)):
+                    if i < len(kv_cache_groups[j].layer_names):
+                        shared_by.append(kv_cache_groups[j].layer_names[i])
+                kv_cache_tensors.append(
+                    KVCacheTensor(size=page_size, shared_by=shared_by)
+                )
+
+        return KVCacheConfig(
+            num_blocks=1,
+            kv_cache_tensors=kv_cache_tensors,
+            kv_cache_groups=kv_cache_groups,
+        )
+
     # Determine how model runners should initialize the KV cache tensors.
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
@@ -1573,8 +1606,16 @@ def get_kv_cache_configs(
         )
 
     # Check if the available memory is enough per worker.
+    skip_pooling_kv_validation = vllm_config.model_config.runner_type == "pooling"
     for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
         if not groups:
+            continue
+        if skip_pooling_kv_validation:
+            logger.warning(
+                "Skipping full-context KV cache validation for pooling models. "
+                "Pooling/classification requests will run without persistent "
+                "paged KV allocation semantics."
+            )
             continue
         _check_enough_kv_cache_memory(
             avail_mem,
