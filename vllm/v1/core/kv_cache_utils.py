@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheTensor,
+    MambaSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -1104,31 +1105,36 @@ def get_kv_cache_config_from_groups(
         )
 
     if vllm_config.model_config.runner_type == "pooling":
-        # Pooling/classification does not need persistent paged KV state.
-        # Keep the KV group structure for attention metadata/backend setup, but
-        # allocate only the null block so startup memory stays close to V0.
-        if len(kv_cache_groups) == 1 and isinstance(
-            kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
-        ):
-            per_layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
-            kv_cache_tensors = [
-                KVCacheTensor(size=per_layer_specs[layer_name].page_size_bytes, shared_by=[layer_name])
-                for layer_name in kv_cache_groups[0].layer_names
-            ]
-        else:
-            group_size = max(len(group.layer_names) for group in kv_cache_groups)
-            page_size = get_uniform_page_size(
-                [group.kv_cache_spec for group in kv_cache_groups]
-            )
-            kv_cache_tensors = []
-            for i in range(group_size):
-                shared_by = []
-                for j in range(len(kv_cache_groups)):
-                    if i < len(kv_cache_groups[j].layer_names):
-                        shared_by.append(kv_cache_groups[j].layer_names[i])
-                kv_cache_tensors.append(
-                    KVCacheTensor(size=page_size, shared_by=shared_by)
+        # Pooling/classification does not need persistent paged KV state for
+        # decoder attention, but hybrid models such as Qwen3.5 still need a
+        # small per-request state buffer for Mamba/GDN layers. Allocate one
+        # dedicated tensor per layer so Mamba layers can get a few request-local
+        # state slots without forcing the same block count on attention layers.
+        pooling_state_slots = max(1, vllm_config.scheduler_config.max_num_seqs)
+        kv_cache_tensors = []
+
+        def add_tensor_for_layer(layer_name: str, spec: KVCacheSpec) -> None:
+            num_pages = 1
+            if isinstance(spec, MambaSpec):
+                num_pages = pooling_state_slots * (
+                    1 + spec.num_speculative_blocks
                 )
+            kv_cache_tensors.append(
+                KVCacheTensor(
+                    size=spec.page_size_bytes * num_pages,
+                    shared_by=[layer_name],
+                )
+            )
+
+        for group in kv_cache_groups:
+            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
+                for layer_name in group.layer_names:
+                    add_tensor_for_layer(
+                        layer_name, group.kv_cache_spec.kv_cache_specs[layer_name]
+                    )
+            else:
+                for layer_name in group.layer_names:
+                    add_tensor_for_layer(layer_name, group.kv_cache_spec)
 
         return KVCacheConfig(
             num_blocks=1,

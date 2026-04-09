@@ -2135,9 +2135,40 @@ class GPUModelRunner(
 
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
 
+        def _get_group_kv_cache_spec(kv_cache_gid: int) -> KVCacheSpec:
+            kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
+            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+                first_layer = kv_cache_groups[kv_cache_gid].layer_names[0]
+                return kv_cache_spec.kv_cache_specs[first_layer]
+            return kv_cache_spec
+
         def _get_block_table(kv_cache_gid: int):
             assert num_reqs_padded is not None and num_tokens_padded is not None
             if self.pooling_no_kv:
+                kv_cache_spec = _get_group_kv_cache_spec(kv_cache_gid)
+                if isinstance(kv_cache_spec, MambaSpec):
+                    num_state_slots = 1 + kv_cache_spec.num_speculative_blocks
+                    blk_table_tensor = torch.full(
+                        (num_reqs_padded, num_state_slots),
+                        -1,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    if num_reqs > 0:
+                        req_slot_bases = (
+                            torch.arange(
+                                num_reqs,
+                                dtype=torch.int32,
+                                device=self.device,
+                            ).unsqueeze(1)
+                            * num_state_slots
+                        )
+                        blk_table_tensor[:num_reqs] = req_slot_bases + torch.arange(
+                            num_state_slots,
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                    return blk_table_tensor
                 return torch.zeros(
                     (num_reqs_padded, 0),
                     dtype=torch.int32,
