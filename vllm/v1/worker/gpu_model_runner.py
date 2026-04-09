@@ -953,6 +953,62 @@ class GPUModelRunner(
             with_numpy=numpy,
         )
 
+    def _ensure_pooling_token_capacity(self, required_tokens: int) -> None:
+        if not self.pooling_no_kv or required_tokens <= self.max_num_tokens:
+            return
+
+        old_max_num_tokens = self.max_num_tokens
+        self.max_num_tokens = required_tokens
+        logger.info(
+            "Growing pooling no-KV token buffers from %d to %d tokens",
+            old_max_num_tokens,
+            self.max_num_tokens,
+        )
+
+        # These buffers are scratch space and are fully overwritten every step,
+        # so it is safe to reinitialize them when a longer pooling request
+        # arrives.
+        self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
+        self.positions = torch.zeros(
+            self.max_num_tokens, dtype=torch.int64, device=self.device
+        )
+        self.req_indices = self._make_buffer(self.max_num_tokens, dtype=torch.int64)
+        self.is_token_ids = self._make_buffer(self.max_num_tokens, dtype=torch.bool)
+
+        if self.enable_prompt_embeds or self.supports_mm_inputs:
+            self.inputs_embeds = self._make_buffer(
+                self.max_num_tokens,
+                self.inputs_embeds_size,
+                dtype=self.dtype,
+                numpy=False,
+            )
+
+        if self.supports_mm_inputs:
+            self.is_mm_embed_buffers = [
+                self._make_buffer(self.max_num_tokens, dtype=torch.bool),
+                self._make_buffer(self.max_num_tokens, dtype=torch.bool),
+            ]
+
+        if self.uses_mrope:
+            self.mrope_positions = self._make_buffer(
+                (3, self.max_num_tokens + 1), dtype=torch.int64
+            )
+
+        if self.uses_xdrope_dim > 0:
+            self.xdrope_positions = self._make_buffer(
+                (self.uses_xdrope_dim, self.max_num_tokens + 1), dtype=torch.int64
+            )
+
+        arange_size = max(self.max_num_reqs + 1, self.max_num_tokens)
+        self.arange_np = np.arange(arange_size, dtype=np.int64)
+        self.query_pos = self._make_buffer(arange_size, dtype=torch.int64)
+        self._arange_scratch = np.empty(arange_size, dtype=np.int64)
+
+        if self.cache_config.kv_sharing_fast_prefill:
+            self.kv_sharing_fast_prefill_logits_indices = torch.zeros(
+                self.max_num_tokens, dtype=torch.int32, device=self.device
+            )
+
     def _get_mamba_copy_bufs(self) -> mamba_utils.MambaCopyBuffers:
         if self._mamba_copy_bufs is None:
             self._mamba_copy_bufs = mamba_utils.MambaCopyBuffers.create(
@@ -3890,6 +3946,8 @@ class GPUModelRunner(
                     return EMPTY_MODEL_RUNNER_OUTPUT
                 return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
 
+            self._ensure_pooling_token_capacity(num_scheduled_tokens)
+
             if self.cache_config.kv_sharing_fast_prefill:
                 assert not self.num_prompt_logprobs, (
                     "--kv-sharing-fast-prefill produces incorrect "
@@ -3931,6 +3989,8 @@ class GPUModelRunner(
                 num_scheduled_tokens_np=num_scheduled_tokens_np,
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
+                allow_microbatching=not self.pooling_no_kv,
+                force_eager=self.pooling_no_kv,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
 
@@ -3944,6 +4004,7 @@ class GPUModelRunner(
             )
 
             num_tokens_padded = batch_desc.num_tokens
+            self._ensure_pooling_token_capacity(num_tokens_padded)
             num_reqs_padded = (
                 batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
             )

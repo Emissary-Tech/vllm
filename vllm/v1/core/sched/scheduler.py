@@ -675,21 +675,34 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
-                    threshold = self.scheduler_config.long_prefill_token_threshold
-                    if 0 < threshold < num_new_tokens:
-                        num_new_tokens = threshold
+                    # V0-style pooling no-KV requests must remain single-shot.
+                    # Splitting them into chunked prefills loses the causal
+                    # prefix because there is no persistent KV state.
+                    if not self.pooling_no_kv:
+                        threshold = self.scheduler_config.long_prefill_token_threshold
+                        if 0 < threshold < num_new_tokens:
+                            num_new_tokens = threshold
+
+                    allow_oversized_pooling_prefill = (
+                        self.pooling_no_kv
+                        and num_computed_tokens == 0
+                        and not self.running
+                        and not num_scheduled_tokens
+                    )
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
                     if (
-                        not self.scheduler_config.enable_chunked_prefill
+                        not allow_oversized_pooling_prefill
+                        and not self.scheduler_config.enable_chunked_prefill
                         and num_new_tokens > token_budget
                     ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
                         break
 
-                    num_new_tokens = min(num_new_tokens, token_budget)
+                    if not allow_oversized_pooling_prefill:
+                        num_new_tokens = min(num_new_tokens, token_budget)
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
@@ -869,7 +882,12 @@ class Scheduler(SchedulerInterface):
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
-        assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
+        if not self.pooling_no_kv:
+            assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
+        elif total_num_scheduled_tokens > self.max_num_scheduled_tokens:
+            assert len(num_scheduled_tokens) == 1, (
+                "Oversized pooling no-KV batches must contain a single request."
+            )
 
         assert token_budget >= 0
         assert len(self.running) <= self.max_num_running_reqs
