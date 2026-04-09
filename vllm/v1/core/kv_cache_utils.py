@@ -1349,6 +1349,20 @@ def _report_kv_cache_config(
             dcp_size,
         )
     num_tokens_str = f"{num_tokens:,}"
+    if vllm_config.model_config.runner_type == "pooling":
+        logger.info_once(
+            "GPU KV cache size: %s tokens (minimal dummy allocation for "
+            "pooling no-KV mode)",
+            num_tokens_str,
+            scope="local",
+        )
+        logger.info_once(
+            "Skipping max-concurrency estimate for pooling models because "
+            "persistent paged KV allocation is disabled.",
+            scope="local",
+        )
+        return
+
     logger.info_once("GPU KV cache size: %s tokens", num_tokens_str, scope="local")
     max_model_len_str = f"{vllm_config.model_config.max_model_len:,}"
     max_concurrency = get_max_concurrency_for_kv_cache_config(
