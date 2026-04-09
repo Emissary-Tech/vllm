@@ -253,6 +253,10 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        if self.pooling_no_kv and self.has_mamba_layers:
+            self.max_num_running_reqs = min(
+                self.max_num_running_reqs, kv_cache_config.num_blocks
+            )
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)

@@ -1110,7 +1110,36 @@ def get_kv_cache_config_from_groups(
         # small per-request state buffer for Mamba/GDN layers. Allocate one
         # dedicated tensor per layer so Mamba layers can get a few request-local
         # state slots without forcing the same block count on attention layers.
-        pooling_state_slots = max(1, vllm_config.scheduler_config.max_num_seqs)
+        layer_specs: list[tuple[str, KVCacheSpec]] = []
+
+        for group in kv_cache_groups:
+            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
+                for layer_name in group.layer_names:
+                    layer_specs.append(
+                        (layer_name, group.kv_cache_spec.kv_cache_specs[layer_name])
+                    )
+            else:
+                for layer_name in group.layer_names:
+                    layer_specs.append((layer_name, group.kv_cache_spec))
+
+        mamba_bytes_per_slot = sum(
+            spec.page_size_bytes * (1 + spec.num_speculative_blocks)
+            for _, spec in layer_specs
+            if isinstance(spec, MambaSpec)
+        )
+        pooling_state_slots = 1
+        if mamba_bytes_per_slot > 0 and available_memory > 0:
+            pooling_state_slots = max(
+                1,
+                min(
+                    vllm_config.scheduler_config.max_num_seqs,
+                    available_memory // mamba_bytes_per_slot,
+                ),
+            )
+            pooling_state_slots = may_override_num_blocks(
+                vllm_config, pooling_state_slots
+            )
+
         kv_cache_tensors = []
 
         def add_tensor_for_layer(layer_name: str, spec: KVCacheSpec) -> None:
@@ -1126,18 +1155,11 @@ def get_kv_cache_config_from_groups(
                 )
             )
 
-        for group in kv_cache_groups:
-            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
-                for layer_name in group.layer_names:
-                    add_tensor_for_layer(
-                        layer_name, group.kv_cache_spec.kv_cache_specs[layer_name]
-                    )
-            else:
-                for layer_name in group.layer_names:
-                    add_tensor_for_layer(layer_name, group.kv_cache_spec)
+        for layer_name, spec in layer_specs:
+            add_tensor_for_layer(layer_name, spec)
 
         return KVCacheConfig(
-            num_blocks=1,
+            num_blocks=pooling_state_slots,
             kv_cache_tensors=kv_cache_tensors,
             kv_cache_groups=kv_cache_groups,
         )
