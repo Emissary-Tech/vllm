@@ -650,7 +650,8 @@ class GPUModelRunner(
 
         # self.cudagraph_batch_sizes sorts in ascending order.
         if (
-            self.compilation_config.cudagraph_capture_sizes
+            not self.pooling_no_kv
+            and self.compilation_config.cudagraph_capture_sizes
             and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
         ):
             self.cudagraph_batch_sizes = sorted(
@@ -964,6 +965,9 @@ class GPUModelRunner(
             old_max_num_tokens,
             self.max_num_tokens,
         )
+
+        if self.lora_config:
+            self.lora_manager.ensure_num_batched_tokens(self.max_num_tokens)
 
         # These buffers are scratch space and are fully overwritten every step,
         # so it is safe to reinitialize them when a longer pooling request

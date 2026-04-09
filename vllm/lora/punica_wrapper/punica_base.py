@@ -135,18 +135,10 @@ class PunicaWrapperBase(PunicaWrapperABC):
         device: torch.device | str,
         **kwargs,
     ):
-        self._token_lora_indices = torch.empty(
-            max_num_batched_tokens, dtype=torch.long, device=device
-        )
-        self._sampler_indices = torch.empty(
-            max_num_batched_tokens, dtype=torch.long, device=device
-        )
-        self._sampler_indices_padded = torch.empty(
-            max_num_batched_tokens, dtype=torch.long, device=device
-        )
-        self._embeddings_indices = torch.empty(
-            2, max_num_batched_tokens, dtype=torch.long, device=device
-        )
+        self.max_num_batched_tokens = max_num_batched_tokens
+        self.max_batches = max_batches
+        self.device: torch.device = torch.device(device)
+        self._allocate_token_metadata_tensors(max_num_batched_tokens)
 
         # 4 is the number of indices tensors.
         # base_indices, sampler_indices, sampler_indices_padded,
@@ -158,12 +150,32 @@ class PunicaWrapperBase(PunicaWrapperABC):
         self._lora_indices_per_batch = torch.empty(
             max_batches, dtype=torch.long, device=device
         )
-        self.device: torch.device = device
         self.max_length: int = 0
         self.token_nums: int = 0
         self.batch_size: int = -1
         self.is_prefill = False
         self.no_lora = False
+
+    def _allocate_token_metadata_tensors(self, max_num_batched_tokens: int) -> None:
+        self._token_lora_indices = torch.empty(
+            max_num_batched_tokens, dtype=torch.long, device=self.device
+        )
+        self._sampler_indices = torch.empty(
+            max_num_batched_tokens, dtype=torch.long, device=self.device
+        )
+        self._sampler_indices_padded = torch.empty(
+            max_num_batched_tokens, dtype=torch.long, device=self.device
+        )
+        self._embeddings_indices = torch.empty(
+            2, max_num_batched_tokens, dtype=torch.long, device=self.device
+        )
+
+    def resize(self, max_num_batched_tokens: int) -> None:
+        if max_num_batched_tokens <= self.max_num_batched_tokens:
+            return
+        self.max_num_batched_tokens = max_num_batched_tokens
+        self._allocate_token_metadata_tensors(max_num_batched_tokens)
+        self.indices_len[:] = [None] * 4
 
     def _update_base_metadata(
         self,

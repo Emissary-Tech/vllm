@@ -100,6 +100,9 @@ class WorkerLoRAManager:
         self._adapter_manager = lora_manager
         return lora_manager.model
 
+    def ensure_num_batched_tokens(self, max_num_batched_tokens: int) -> None:
+        self._adapter_manager.ensure_num_batched_tokens(max_num_batched_tokens)
+
     def _load_adapter(self, lora_request: LoRARequest) -> LoRAModel:
         try:
             supported_lora_modules = self._adapter_manager.supported_lora_modules

@@ -358,6 +358,20 @@ class LoRAModelManager:
             self.vocab_size,
         )
 
+    def ensure_num_batched_tokens(self, max_num_batched_tokens: int) -> None:
+        max_num_batched_tokens = math.ceil(max_num_batched_tokens / 8) * 8
+        if max_num_batched_tokens <= self.max_num_batched_tokens:
+            return
+
+        logger.info(
+            "Growing LoRA Punica metadata buffers from %d to %d tokens",
+            self.max_num_batched_tokens,
+            max_num_batched_tokens,
+        )
+        self.max_num_batched_tokens = max_num_batched_tokens
+        for punica_wrapper in self.punica_wrapper_mapping.values():
+            punica_wrapper.resize(max_num_batched_tokens)
+
     def remove_all_adapters(self):
         """Remove all LoRAModels from the manager."""
         self._registered_adapters.clear()

@@ -48,9 +48,21 @@ class PunicaWrapperXPU(PunicaWrapperBase):
 
         self.lora_config = kwargs["lora_config"]
         self.max_loras = self.lora_config.max_loras
+        self._init_kernel_metadata(max_num_batched_tokens)
+
+    def _init_kernel_metadata(self, max_num_batched_tokens: int) -> None:
         self.token_mapping_meta = LoRAKernelMeta.make(
-            self.max_loras, max_num_batched_tokens, device=device
+            self.max_loras, max_num_batched_tokens, device=self.device
         )
+
+    def resize(self, max_num_batched_tokens: int) -> None:
+        if max_num_batched_tokens <= self.max_num_batched_tokens:
+            return
+        super().resize(max_num_batched_tokens)
+        torch._dynamo.mark_dynamic(self._token_lora_indices, 0)
+        torch._dynamo.mark_dynamic(self._embeddings_indices, 1)
+        torch._dynamo.mark_dynamic(self._sampler_indices_padded, 0)
+        self._init_kernel_metadata(max_num_batched_tokens)
 
     def update_metadata(
         self,
