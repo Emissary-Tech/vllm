@@ -604,7 +604,9 @@ class TritonAttentionImpl(AttentionImpl):
             b_start_loc=attn_metadata.query_start_loc,
             b_seq_len=attn_metadata.seq_lens,
             max_input_len=attn_metadata.max_query_len,
-            is_causal=attn_metadata.causal,
+            # Pooling no-KV mode only routes decoder self-attention here.
+            # Keep causal semantics identical to the original decoder path.
+            is_causal=True,
             softmax_scale=self.scale,
             sliding_window_q=self.sliding_window[0],
             sliding_window_k=self.sliding_window[1],
