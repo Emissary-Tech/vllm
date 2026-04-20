@@ -1212,6 +1212,58 @@ async def get_hidden_states(raw_request: Request):
     return JSONResponse(content={"hidden_states": hidden_states})
 
 
+@router.post("/v1/hidden_states_batch")
+async def get_hidden_states_batch(raw_request: Request):
+    """Batch variant: N prompts → N last-token hidden states in one HTTP call.
+
+    All prompts are dispatched concurrently to the async engine so vLLM's
+    scheduler can group them into GPU batches (continuous batching benefits).
+    Eliminates per-prompt HTTP round-trips vs calling /v1/hidden_states N times.
+
+    Request body: {"prompts": ["...", "...", ...]}
+    Response: {"hidden_states": [[...], [...], ...]}  # shape: [N, hidden_dim]
+    """
+    client = engine_client(raw_request)
+    if not isinstance(client, AsyncLLMEngine):
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_IMPLEMENTED.value,
+            detail="/v1/hidden_states_batch requires V0 mode "
+            "(VLLM_USE_V1=0) with --disable-frontend-multiprocessing")
+
+    try:
+        body = await raw_request.json()
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value,
+                            detail=f"JSON decode error: {e}") from e
+
+    prompts = body.get("prompts")
+    if prompts is None or not isinstance(prompts, list):
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value,
+                            detail="Missing or invalid 'prompts' list")
+    if not all(isinstance(p, str) for p in prompts):
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value,
+                            detail="All prompts must be strings")
+    if not prompts:
+        return JSONResponse(content={"hidden_states": []})
+
+    sampling_params = SamplingParams(max_tokens=1, temperature=0)
+
+    async def _one(prompt: str):
+        request_id = f"hs-{uuid.uuid4().hex}"
+        async for _ in client.generate(prompt, sampling_params, request_id):
+            pass
+        return await client.get_hidden_states(request_id)
+
+    results = await asyncio.gather(*[_one(p) for p in prompts])
+    for i, h in enumerate(results):
+        if h is None:
+            raise HTTPException(
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                detail=f"Hidden states not available for prompt index {i}. "
+                "Ensure --return-hidden-states is enabled.")
+    return JSONResponse(content={"hidden_states": results})
+
+
 @router.post("/scale_elastic_ep",
              dependencies=[Depends(validate_json_request)],
              responses={
