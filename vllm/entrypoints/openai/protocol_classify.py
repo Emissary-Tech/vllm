@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Literal, Optional, Union
+from typing import Any, Literal, Optional, Union
 
 from fastapi import Request
 from pydantic import BaseModel, Field
@@ -14,8 +14,21 @@ class ClassifyCompletionRequest(PoolingCompletionRequest):
     """Request for the classify endpoint using completion format."""
     classification_type: Literal["multiclass", "multilabel", "binary",
                                  "regression"] = "multiclass"
-
-    pass
+    chat_template: Optional[str] = Field(
+        default=None,
+        description=(
+            "A Jinja template to use when a classification adapter requires "
+            "chat template preprocessing."),
+    )
+    chat_template_kwargs: Optional[dict[str, Any]] = Field(
+        default=None,
+        description=("Additional kwargs to pass to the template renderer. "
+                     "Will be accessible by the chat template."),
+    )
+    mm_processor_kwargs: Optional[dict[str, Any]] = Field(
+        default=None,
+        description=("Additional kwargs to pass to the HF processor."),
+    )
 
 
 class ClassifyChatRequest(PoolingChatRequest):
