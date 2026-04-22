@@ -2,12 +2,16 @@
 
 import asyncio
 import base64
+import json
+import os
 import time
 from collections.abc import AsyncGenerator
-from typing import Final, Literal, Optional, Union, cast
+from functools import lru_cache
+from typing import Any, Final, Literal, Optional, Union, cast
 
 import jinja2
 import numpy as np
+import torch
 from fastapi import Request
 from typing_extensions import assert_never
 
@@ -25,6 +29,7 @@ from vllm.entrypoints.openai.protocol import UsageInfo
 from vllm.entrypoints.openai.serving_engine import OpenAIServing
 from vllm.entrypoints.openai.serving_models import OpenAIServingModels
 from vllm.logger import init_logger
+from vllm.lora.request import LoRARequest
 from vllm.outputs import PoolingOutput, PoolingRequestOutput
 from vllm.utils import merge_async_iterators
 
@@ -44,6 +49,86 @@ def _get_data(
         return base64.b64encode(pooling_bytes).decode("utf-8")
 
     assert_never(encoding_format)
+
+
+@lru_cache(maxsize=128)
+def _load_json_file(path: str) -> dict[str, Any]:
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except OSError:
+        return {}
+
+
+@lru_cache(maxsize=128)
+def _load_adapter_metadata(adapter_path: str) -> dict[str, Any]:
+    adapter_config = _load_json_file(
+        os.path.join(adapter_path, "adapter_config.json"))
+    task_details = _load_json_file(
+        os.path.join(adapter_path, "task_details.json"))
+    metadata = dict(task_details)
+    metadata.update(adapter_config)
+    return metadata
+
+
+def _get_adapter_config(
+    lora_request: Optional[LoRARequest],
+) -> dict[str, Any]:
+    if lora_request is None:
+        return {}
+    return _load_adapter_metadata(lora_request.lora_path)
+
+
+def _is_zero_shot_head(adapter_config: dict[str, Any]) -> bool:
+    target_modules = adapter_config.get("target_modules")
+    modules_to_save = adapter_config.get("modules_to_save") or []
+    if isinstance(modules_to_save, str):
+        modules_to_save = [modules_to_save]
+    saved_heads = {"score", "classifier"}.intersection(modules_to_save)
+    return target_modules == [] and bool(saved_heads)
+
+
+def _get_response_activation(
+    request: ClassifyRequest,
+    adapter_config: dict[str, Any],
+) -> str:
+    del adapter_config
+    if request.classification_type == "regression":
+        return "identity"
+    if request.classification_type in ("multilabel", "binary"):
+        return "sigmoid"
+    return "softmax"
+
+
+def _get_probabilities(
+    output: PoolingOutput,
+    activation: str,
+) -> list[float]:
+    if activation in ("identity", "regression", "none"):
+        return []
+
+    logits = output.data.to(dtype=torch.float32)
+    if activation in ("softmax", "multiclass"):
+        return torch.softmax(logits, dim=-1).tolist()
+    if activation in ("sigmoid", "multilabel"):
+        return torch.sigmoid(logits).tolist()
+
+    return []
+
+
+def _should_apply_chat_template(adapter_config: dict[str, Any]) -> bool:
+    return _is_zero_shot_head(adapter_config)
+
+
+def _completion_input_to_chat_messages(
+    input_data: Union[list[int], list[list[int]], str, list[str]],
+) -> Optional[list[list[dict[str, str]]]]:
+    if isinstance(input_data, str):
+        return [[{"role": "user", "content": input_data}]]
+    if (isinstance(input_data, list)
+            and all(isinstance(item, str) for item in input_data)):
+        return [[{"role": "user", "content": item}] for item in input_data]
+    return None
 
 
 class OpenAIServingClassify(OpenAIServing):
@@ -107,31 +192,63 @@ class OpenAIServingClassify(OpenAIServing):
             ) = self._maybe_get_adapters(request)
 
             tokenizer = await self.engine_client.get_tokenizer(lora_request)
+            adapter_config = _get_adapter_config(lora_request)
+            response_activation = _get_response_activation(
+                request, adapter_config)
 
             if prompt_adapter_request is not None:
                 raise NotImplementedError("Prompt adapter is not supported "
                                           "for classification models")
 
             # Process input based on request type (chat or completion)
-            if isinstance(request, ClassifyChatRequest):
-                (
-                    _,
-                    request_prompts,
-                    engine_prompts,
-                ) = await self._preprocess_chat(
-                    request,
-                    tokenizer,
-                    request.messages,
-                    chat_template=request.chat_template or self.chat_template,
-                    chat_template_content_format=self.
-                    chat_template_content_format,
-                    # In classification requests, we are not generating tokens,
-                    # so there is no need to append extra tokens to the input
-                    add_generation_prompt=False,
-                    continue_final_message=False,
-                    truncate_prompt_tokens=truncate_prompt_tokens,
-                    add_special_tokens=request.add_special_tokens,
-                )
+            if (isinstance(request, ClassifyChatRequest)
+                    or _should_apply_chat_template(adapter_config)):
+                if isinstance(request, ClassifyChatRequest):
+                    message_batches = [request.messages]
+                else:
+                    message_batches = _completion_input_to_chat_messages(
+                        request.input)
+                    if message_batches is None:
+                        return self.create_error_response(
+                            "This classification adapter requires chat "
+                            "template preprocessing, so input must be a "
+                            "string or list of strings.")
+
+                request_prompts = []
+                engine_prompts = []
+                is_zero_shot_head = _is_zero_shot_head(adapter_config)
+                chat_template_kwargs = {}
+                if is_zero_shot_head:
+                    chat_template_kwargs.setdefault("enable_thinking", False)
+                chat_template_kwargs.update(
+                    getattr(request, "chat_template_kwargs", None) or {})
+                add_generation_prompt = (
+                    True if is_zero_shot_head else getattr(
+                        request, "add_generation_prompt", False))
+                continue_final_message = getattr(
+                    request, "continue_final_message", False)
+
+                for messages in message_batches:
+                    (
+                        _,
+                        request_prompts_i,
+                        engine_prompts_i,
+                    ) = await self._preprocess_chat(
+                        request,
+                        tokenizer,
+                        messages,
+                        chat_template=getattr(request, "chat_template", None)
+                        or self.chat_template,
+                        chat_template_content_format=self.
+                        chat_template_content_format,
+                        add_generation_prompt=add_generation_prompt,
+                        continue_final_message=continue_final_message,
+                        chat_template_kwargs=chat_template_kwargs,
+                        truncate_prompt_tokens=truncate_prompt_tokens,
+                        add_special_tokens=request.add_special_tokens,
+                    )
+                    request_prompts.extend(request_prompts_i)
+                    engine_prompts.extend(engine_prompts_i)
             else:
                 (request_prompts,
                  engine_prompts) = await self._preprocess_completion(
@@ -200,6 +317,7 @@ class OpenAIServingClassify(OpenAIServing):
                 created_time,
                 model_name,
                 encoding_format,
+                response_activation,
             )
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
@@ -216,6 +334,7 @@ class OpenAIServingClassify(OpenAIServing):
         created_time: int,
         model_name: str,
         encoding_format: Literal["float", "base64"],
+        response_activation: str,
     ) -> ClassifyResponse:
         items: list[ClassifyResponseData] = []
         num_prompt_tokens = 0
@@ -224,6 +343,8 @@ class OpenAIServingClassify(OpenAIServing):
             item = ClassifyResponseData(
                 index=idx,
                 logits=_get_data(final_res.outputs, encoding_format),
+                probabilities=_get_probabilities(final_res.outputs,
+                                                 response_activation),
             )
             prompt_token_ids = final_res.prompt_token_ids
 

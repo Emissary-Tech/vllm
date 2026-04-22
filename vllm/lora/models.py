@@ -109,10 +109,39 @@ def _replace_classification_head(base_model, num_labels, hidden_size, device, dt
     return new_head
 
 
-def _attach_classification_head(base_model, tensors: dict):
+def _is_head_only_adapter(peft_helper: PEFTHelper,
+                          tensors: dict[str, torch.Tensor]) -> bool:
+    target_modules = peft_helper.target_modules
+    if target_modules != []:
+        return False
+
+    if not tensors:
+        return False
+
+    has_head_weight = False
+    for key in tensors:
+        if key.endswith(("score.weight", "classifier.weight")):
+            has_head_weight = True
+            continue
+        if key.endswith(("score.bias", "classifier.bias")):
+            continue
+        return False
+
+    return has_head_weight
+
+
+def _head_output_size(tensors: dict[str, torch.Tensor]) -> Optional[int]:
+    for key, tensor in tensors.items():
+        if key.endswith(("score.weight", "classifier.weight")):
+            return tensor.shape[0]
+    return None
+
+
+def _attach_classification_head(base_model, tensors: dict,
+                                peft_helper: PEFTHelper):
     """
     Attach a classification head to base_model using weights from tensors.
-    
+
     This improved implementation ensures proper cache clearing and complete
     replacement of classification heads when switching between adapters.
     
@@ -120,6 +149,8 @@ def _attach_classification_head(base_model, tensors: dict):
         base_model: The model to attach the classification head to
         tensors: Dictionary of tensor weights from the adapter
     """
+    if base_model is None:
+        return
     
     # Find classification weight and bias in tensors
     weight_key = None
@@ -189,6 +220,11 @@ def _attach_classification_head(base_model, tensors: dict):
                 base_model.score.bias.copy_(bias_tensor)
             else:
                 logger.warning(f"Bias key {bias_key} found in adapter but model has no bias")
+
+    head_only = _is_head_only_adapter(peft_helper, tensors)
+    base_model.classification_head_use_cosine = (
+        head_only and (_head_output_size(tensors) or 0) > 1)
+    base_model.classification_head_temperature = 40.0
     
     logger.info(f"Successfully attached classification head with {num_labels} labels to the model")
 
@@ -391,7 +427,6 @@ class LoRAModel(AdapterModel):
                 # Load tensors if there are only expected modules.
                 for module in f.keys():  # noqa
                     tensors[module] = f.get_tensor(module)
-                _attach_classification_head(model_cls, tensors)
         elif os.path.isfile(lora_bin_file_path):
             # When a bin file is provided, we rely on config to find unexpected
             # modules.
@@ -421,6 +456,8 @@ class LoRAModel(AdapterModel):
                                  weights_only=True)
         else:
             raise ValueError(f"{lora_dir} doesn't contain tensors")
+
+        _attach_classification_head(model_cls, tensors, peft_helper)
 
         embeddings = None
         if os.path.isfile(new_embeddings_tensor_path):

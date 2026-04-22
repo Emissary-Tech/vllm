@@ -12,14 +12,29 @@ from vllm.entrypoints.openai.protocol import (ErrorResponse, OpenAIBaseModel,
 # Create separate classes for completion and chat requests
 class ClassifyCompletionRequest(PoolingCompletionRequest):
     """Request for the classify endpoint using completion format."""
-    classification_type: Literal["multiclass", "multilabel"]
+    classification_type: Literal["multiclass", "multilabel", "binary",
+                                 "regression"] = "multiclass"
 
     pass
 
 
 class ClassifyChatRequest(PoolingChatRequest):
     """Request for the classify endpoint using chat format."""
-    classification_type: Literal["multiclass", "multilabel"]
+    classification_type: Literal["multiclass", "multilabel", "binary",
+                                 "regression"] = "multiclass"
+    add_generation_prompt: bool = Field(
+        default=False,
+        description=(
+            "If true, add the generation prompt when rendering the chat "
+            "template. Keep this aligned with the prompt format used while "
+            "training the classification head."),
+    )
+    continue_final_message: bool = Field(
+        default=False,
+        description=(
+            "If true, format the final chat message as open-ended. Cannot be "
+            "used with add_generation_prompt."),
+    )
 
     pass
 

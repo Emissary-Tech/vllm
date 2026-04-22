@@ -1050,7 +1050,7 @@ async def init_app_state(
             model_config=model_config,
             models=state.openai_serving_models,
             request_logger=request_logger,
-            chat_template=None,
+            chat_template=resolved_chat_template,
             chat_template_content_format=args.chat_template_content_format,
         )
         openai_serving_classify = OpenAIServingClassify(
@@ -1058,7 +1058,7 @@ async def init_app_state(
             model_config=model_config,
             models=state.openai_serving_models,
             request_logger=request_logger,
-            chat_template=None,
+            chat_template=resolved_chat_template,
             chat_template_content_format=args.chat_template_content_format,
         )
     

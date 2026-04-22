@@ -773,5 +773,11 @@ def get_cross_encoder_activation_function(config: PretrainedConfig):
             "Loading of activation functions is restricted to " \
             "torch.nn.modules for security reasons"
         return resolve_obj_by_qualname(function_name)()
-    else:
-        return nn.Sigmoid() if config.num_labels == 1 else nn.Identity()
+
+    problem_type = getattr(config, "problem_type", None)
+    if problem_type == "regression":
+        return nn.Identity()
+    if problem_type == "multi_label_classification":
+        return nn.Sigmoid()
+
+    return nn.Sigmoid() if config.num_labels == 1 else nn.Identity()

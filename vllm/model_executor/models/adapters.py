@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Optional, TypeVar
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .interfaces_base import VllmModelForPooling, is_pooling_model
 
@@ -207,6 +208,11 @@ def as_classification_model(cls: _T) -> _T:
             hidden_states = super().forward(input_ids, positions,
                                             intermediate_tensors,
                                             inputs_embeds)
+            if getattr(self, "classification_head_use_cosine", False):
+                tau = getattr(self, "classification_head_temperature", 40.0)
+                hidden_states = F.normalize(hidden_states.float(), dim=-1)
+                weight = F.normalize(self.score.weight.float(), dim=-1)
+                return tau * F.linear(hidden_states, weight)
             logits, _ = self.score(hidden_states)
             return logits
 
