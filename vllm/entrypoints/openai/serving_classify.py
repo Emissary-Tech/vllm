@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import os
+import string
 import time
 from collections.abc import AsyncGenerator
 from functools import lru_cache
@@ -52,18 +53,27 @@ def _get_data(
 
 
 @lru_cache(maxsize=128)
-def _load_json_file(path: str) -> dict[str, Any]:
+def _load_json_file(path: str, *, required: bool = False) -> dict[str, Any]:
     try:
         with open(path) as f:
             return json.load(f)
     except OSError:
+        return {}
+    except json.JSONDecodeError:
+        if required:
+            raise
+        logger.warning("Ignoring invalid optional adapter metadata JSON: %s",
+                       path)
         return {}
 
 
 @lru_cache(maxsize=128)
 def _load_adapter_metadata(adapter_path: str) -> dict[str, Any]:
     adapter_config = _load_json_file(
-        os.path.join(adapter_path, "adapter_config.json"))
+        os.path.join(adapter_path, "adapter_config.json"), required=True)
+    if not _is_zero_shot_head(adapter_config):
+        return adapter_config
+
     task_details = _load_json_file(
         os.path.join(adapter_path, "task_details.json"))
     metadata = dict(task_details)
@@ -120,15 +130,99 @@ def _should_apply_chat_template(adapter_config: dict[str, Any]) -> bool:
     return _is_zero_shot_head(adapter_config)
 
 
+def _should_wrap_tool_server_prompt(adapter_config: dict[str, Any]) -> bool:
+    return (_is_zero_shot_head(adapter_config)
+            and adapter_config.get("prompt_format") == "tool_server_v1")
+
+
+def _get_prompt_classes(adapter_config: dict[str, Any]) -> list[dict[str, Any]]:
+    classes = adapter_config.get("classes")
+    if isinstance(classes, list):
+        return [cls for cls in classes if isinstance(cls, dict)]
+
+    labels = adapter_config.get("labels") or adapter_config.get("label_names")
+    if isinstance(labels, list):
+        return [{"name": str(label)} for label in labels]
+
+    return []
+
+
+def _wrap_tool_server_prompt(query: str,
+                             adapter_config: dict[str, Any]) -> str:
+    mode = adapter_config.get("mode", "tool_calling")
+
+    if mode == "judge":
+        criteria = adapter_config.get("criteria")
+        if criteria:
+            query = f"Criteria: {criteria}\n\n{query}"
+        return (
+            f"You are a classifier.\n\n"
+            f"[INPUT]\n{query}\n\n"
+            f"Categories:\n"
+            f"A) Yes\n\n"
+            f"B) No\n\n"
+            f"Answer with ONLY the single letter (A, B).\n"
+            f"Answer:"
+        )
+
+    classes = _get_prompt_classes(adapter_config)
+    if not classes:
+        raise ValueError("tool_server_v1 prompt wrapping requires classes "
+                         "metadata in task_details.json.")
+
+    codes = list(string.ascii_uppercase)
+    options = []
+    for i, cls in enumerate(classes):
+        desc = cls.get("description", "")
+        if desc:
+            options.append(f"{codes[i]}) {cls['name']}\n- {desc}")
+        else:
+            options.append(f"{codes[i]}) {cls['name']}")
+    options_block = "\n\n".join(options)
+    code_list = ", ".join(codes[:len(classes)])
+
+    return (
+        f"You are a classifier.\n\n"
+        f"[INPUT]\n{query}\n\n"
+        f"Categories:\n{options_block}\n\n"
+        f"Answer with ONLY the single letter ({code_list}).\n"
+        f"Answer:"
+    )
+
+
 def _completion_input_to_chat_messages(
     input_data: Union[list[int], list[list[int]], str, list[str]],
+    adapter_config: dict[str, Any],
 ) -> Optional[list[list[dict[str, str]]]]:
+    def wrap_content(content: str) -> str:
+        if _should_wrap_tool_server_prompt(adapter_config):
+            return _wrap_tool_server_prompt(content, adapter_config)
+        return content
+
     if isinstance(input_data, str):
-        return [[{"role": "user", "content": input_data}]]
+        return [[{"role": "user", "content": wrap_content(input_data)}]]
     if (isinstance(input_data, list)
             and all(isinstance(item, str) for item in input_data)):
-        return [[{"role": "user", "content": item}] for item in input_data]
+        return [[{"role": "user", "content": wrap_content(item)}]
+                for item in input_data]
     return None
+
+
+def _maybe_wrap_chat_messages(
+    messages: list[dict[str, Any]],
+    adapter_config: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not _should_wrap_tool_server_prompt(adapter_config):
+        return messages
+    if len(messages) != 1:
+        return messages
+    message = dict(messages[0])
+    if message.get("role") != "user" or not isinstance(
+            message.get("content"), str):
+        return messages
+    message["content"] = _wrap_tool_server_prompt(message["content"],
+                                                  adapter_config)
+    return [message]
 
 
 class OpenAIServingClassify(OpenAIServing):
@@ -204,10 +298,13 @@ class OpenAIServingClassify(OpenAIServing):
             if (isinstance(request, ClassifyChatRequest)
                     or _should_apply_chat_template(adapter_config)):
                 if isinstance(request, ClassifyChatRequest):
-                    message_batches = [request.messages]
+                    message_batches = [
+                        _maybe_wrap_chat_messages(request.messages,
+                                                  adapter_config)
+                    ]
                 else:
                     message_batches = _completion_input_to_chat_messages(
-                        request.input)
+                        request.input, adapter_config)
                     if message_batches is None:
                         return self.create_error_response(
                             "This classification adapter requires chat "
