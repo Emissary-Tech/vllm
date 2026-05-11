@@ -883,16 +883,41 @@ class LLMEngine:
                     if (spec is not None and seq_group_meta.is_prompt
                             and chunk_size > 0):
                         seq_data = next(iter(seq_group_meta.seq_data.values()))
-                        chunk_start = int(seq_data.get_num_computed_tokens())
+                        computed_tokens = int(seq_data.get_num_computed_tokens())
                         selected_positions = spec.get("positions")
+
+                        # The activation tensor segment is indexed by tokens in
+                        # the current prefill chunk. Depending on where output
+                        # processing observes SequenceData, computed_tokens may
+                        # be either the chunk start or the chunk end. API callers
+                        # use prompt-local token positions, so choose the chunk
+                        # start that best matches explicitly requested positions.
+                        chunk_start_candidates = [computed_tokens]
+                        if computed_tokens >= chunk_size:
+                            chunk_start_candidates.append(
+                                max(0, computed_tokens - chunk_size))
+
                         if selected_positions is None:
+                            if computed_tokens >= int(seq_data.get_len()):
+                                chunk_start = max(0, computed_tokens - chunk_size)
+                            else:
+                                chunk_start = computed_tokens
                             selected_positions = list(
                                 range(chunk_start, chunk_start + chunk_size))
                         else:
+                            requested_positions = [int(pos) for pos in selected_positions]
+
+                            def _overlap_count(start: int) -> int:
+                                end = start + chunk_size
+                                return sum(start <= pos < end
+                                           for pos in requested_positions)
+
+                            chunk_start = max(
+                                chunk_start_candidates,
+                                key=lambda start: (_overlap_count(start), -start))
                             selected_positions = [
-                                int(pos) for pos in selected_positions
-                                if chunk_start <= int(pos) <
-                                chunk_start + chunk_size
+                                pos for pos in requested_positions
+                                if chunk_start <= pos < chunk_start + chunk_size
                             ]
                         local_indices = [
                             pos - chunk_start for pos in selected_positions
