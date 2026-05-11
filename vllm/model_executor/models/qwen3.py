@@ -94,6 +94,11 @@ class Qwen3Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.dual_chunk_attention_config = dual_chunk_attention_config
+        self.layer_idx = extract_layer_index(prefix)
+        self._emissary_capture_enabled = False
+        self._emissary_capture_kind = "value"
+        self._emissary_capture_buffer: Optional[
+            dict[str, dict[int, torch.Tensor]]] = None
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -130,12 +135,21 @@ class Qwen3Attention(nn.Module):
             prefix=f"{prefix}.attn",
             attn_type=attn_type,
             **{
-                "layer_idx": extract_layer_index(prefix),
+                "layer_idx": self.layer_idx,
                 "dual_chunk_attention_config": dual_chunk_attention_config,
             } if dual_chunk_attention_config else {},
         )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+
+    def _emissary_store_activation(self, kind: str,
+                                   tensor: torch.Tensor) -> None:
+        if (not self._emissary_capture_enabled
+                or self._emissary_capture_kind != kind
+                or self._emissary_capture_buffer is None):
+            return
+        self._emissary_capture_buffer.setdefault(kind, {})[
+            self.layer_idx] = tensor.detach()
 
     def forward(
         self,
@@ -144,6 +158,7 @@ class Qwen3Attention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        self._emissary_store_activation("value", v)
         # Add qk-norm
         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim,
                            self.head_dim)
@@ -155,6 +170,7 @@ class Qwen3Attention(nn.Module):
         k = k_by_head.view(k.shape)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
+        self._emissary_store_activation("attn_output", attn_output)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -303,9 +319,60 @@ class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
 
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
+        self._emissary_layer_activation_buffer: dict[
+            str, dict[int, torch.Tensor]] = {}
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.model.aux_hidden_state_layers = layers
+
+    def _emissary_resolve_layers(self, layers: Iterable[int]) -> list[int]:
+        n_layers = len(self.model.layers)
+        resolved: list[int] = []
+        for raw_layer in layers:
+            idx = int(raw_layer)
+            if idx < 0:
+                idx = n_layers + idx
+            if idx < 0 or idx >= n_layers:
+                raise ValueError(
+                    f"layer {raw_layer} resolves to {idx}, outside "
+                    f"[0, {n_layers})")
+            resolved.append(idx)
+        return sorted(set(resolved))
+
+    def set_emissary_layer_activation_capture(
+            self, layers: Iterable[int],
+            activation: str = "value") -> list[int]:
+        if activation not in {"value", "attn_output"}:
+            raise ValueError(
+                "activation must be one of: 'value', 'attn_output'")
+        resolved_layers = set(self._emissary_resolve_layers(layers))
+        self._emissary_layer_activation_buffer.clear()
+        for idx, layer in enumerate(self.model.layers):
+            attn = getattr(layer, "self_attn", None)
+            enabled = idx in resolved_layers and isinstance(attn, Qwen3Attention)
+            if isinstance(attn, Qwen3Attention):
+                attn._emissary_capture_enabled = enabled
+                attn._emissary_capture_kind = activation
+                attn._emissary_capture_buffer = (
+                    self._emissary_layer_activation_buffer if enabled else None)
+        return sorted(resolved_layers)
+
+    def clear_emissary_layer_activation_capture(self) -> None:
+        self._emissary_layer_activation_buffer.clear()
+        for layer in self.model.layers:
+            attn = getattr(layer, "self_attn", None)
+            if isinstance(attn, Qwen3Attention):
+                attn._emissary_capture_enabled = False
+                attn._emissary_capture_buffer = None
+
+    def pop_emissary_layer_activations(
+            self) -> dict[str, dict[int, torch.Tensor]]:
+        captured = {
+            kind: dict(layer_map)
+            for kind, layer_map in self._emissary_layer_activation_buffer.items()
+        }
+        self._emissary_layer_activation_buffer.clear()
+        return captured
 
     def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
         num_layers = len(self.model.layers)

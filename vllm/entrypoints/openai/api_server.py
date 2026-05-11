@@ -118,6 +118,23 @@ prometheus_multiproc_dir: tempfile.TemporaryDirectory
 logger = init_logger('vllm.entrypoints.openai.api_server')
 
 _running_tasks: set[asyncio.Task] = set()
+_layer_activation_lock = asyncio.Lock()
+
+
+def _enable_emissary_layer_capture(model, layers: list[int],
+                                   activation: str):
+    setter = getattr(model, "set_emissary_layer_activation_capture", None)
+    if not callable(setter):
+        return None
+    return setter(layers, activation)
+
+
+def _clear_emissary_layer_capture(model) -> bool:
+    clearer = getattr(model, "clear_emissary_layer_activation_capture", None)
+    if not callable(clearer):
+        return False
+    clearer()
+    return True
 
 
 @asynccontextmanager
@@ -1262,6 +1279,139 @@ async def get_hidden_states_batch(raw_request: Request):
                 detail=f"Hidden states not available for prompt index {i}. "
                 "Ensure --return-hidden-states is enabled.")
     return JSONResponse(content={"hidden_states": results})
+
+
+@router.post("/v1/layer_activations")
+@router.post("/v1/prefill_layer_activations")
+async def get_prefill_layer_activations(raw_request: Request):
+    """Capture selected prefill layer activations for a prompt."""
+    client = engine_client(raw_request)
+    if not isinstance(client, AsyncLLMEngine):
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_IMPLEMENTED.value,
+            detail="/v1/prefill_layer_activations requires V0 mode "
+            "(VLLM_USE_V1=0) with --disable-frontend-multiprocessing")
+
+    try:
+        body = await raw_request.json()
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value,
+                            detail=f"JSON decode error: {e}") from e
+
+    prompt = body.get("prompt")
+    if prompt is None or not isinstance(prompt, str):
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value,
+                            detail="Missing or invalid 'prompt' in request")
+
+    activation = body.get("activation", "value")
+    if activation not in {"value", "attn_output"}:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="activation must be one of: 'value', 'attn_output'")
+
+    raw_layers = body.get("layers")
+    if not isinstance(raw_layers, list) or not raw_layers:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value,
+                            detail="'layers' must be a non-empty list")
+    try:
+        layers = [int(layer) for layer in raw_layers]
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value,
+                            detail="'layers' must contain integers") from exc
+
+    raw_positions = body.get("positions")
+    positions: Optional[list[int]]
+    if raw_positions is None:
+        positions = None
+    elif isinstance(raw_positions, list):
+        try:
+            positions = [int(pos) for pos in raw_positions]
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail="'positions' must contain integers") from exc
+        if any(pos < 0 for pos in positions):
+            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value,
+                                detail="'positions' must be non-negative")
+    else:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value,
+                            detail="'positions' must be a list when provided")
+
+    request_id = f"acts-{uuid.uuid4().hex}"
+    sampling_params = SamplingParams(max_tokens=1, temperature=0)
+
+    async with _layer_activation_lock:
+        try:
+            enabled = await client.apply_model(
+                lambda model: _enable_emissary_layer_capture(
+                    model, layers, activation))
+        except Exception as exc:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=f"Failed to enable layer activation capture: {exc}"
+            ) from exc
+
+        resolved_layers = next((item for item in enabled if item), None)
+        if resolved_layers is None:
+            raise HTTPException(
+                status_code=HTTPStatus.NOT_IMPLEMENTED.value,
+                detail="The loaded model does not support emissary layer "
+                "activation capture")
+        layers = [int(layer) for layer in resolved_layers]
+
+        await client.register_layer_activation_request(
+            request_id, activation, layers, positions)
+        try:
+            async for _ in client.generate(prompt, sampling_params, request_id):
+                pass
+            captured = await client.get_layer_activations(request_id)
+        finally:
+            await client.clear_layer_activation_request(request_id)
+            await client.apply_model(
+                lambda model: _clear_emissary_layer_capture(model))
+
+    if captured is None:
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+            detail="Layer activations not available. Ensure "
+            "--return-hidden-states is enabled and requested positions are in "
+            "the prefill chunk.")
+
+    layer_maps = captured.get("layers", {})
+    available_positions = sorted({
+        int(pos)
+        for pos_map in layer_maps.values()
+        for pos in pos_map.keys()
+    })
+    response_positions = (
+        [pos for pos in positions if pos in available_positions]
+        if positions is not None else available_positions)
+
+    activations: dict[str, list] = {}
+    positions_by_layer: dict[str, list[int]] = {}
+    shapes: dict[str, list[int]] = {}
+    for layer in layers:
+        layer_key = str(layer)
+        pos_map = layer_maps.get(layer_key, {})
+        layer_positions = [
+            pos for pos in response_positions if str(pos) in pos_map
+        ]
+        rows = [pos_map[str(pos)] for pos in layer_positions]
+        activations[layer_key] = rows
+        positions_by_layer[layer_key] = layer_positions
+        shapes[layer_key] = [
+            len(rows),
+            len(rows[0]) if rows and isinstance(rows[0], list) else 0,
+        ]
+
+    return JSONResponse(content={
+        "activation": activation,
+        "layers": layers,
+        "positions": response_positions,
+        "positions_by_layer": positions_by_layer,
+        "activations": activations,
+        "shape": shapes,
+    })
 
 
 @router.post("/scale_elastic_ep",

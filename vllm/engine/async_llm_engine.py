@@ -1029,6 +1029,22 @@ class AsyncLLMEngine(EngineClient):
         """Pop cached hidden states for a completed request."""
         return self.engine.pop_hidden_states(request_id)
 
+    async def register_layer_activation_request(
+            self,
+            request_id: str,
+            activation: str,
+            layers: list[int],
+            positions: Optional[list[int]] = None) -> None:
+        self.engine.register_layer_activation_request(
+            request_id, activation, layers, positions)
+
+    async def get_layer_activations(self, request_id: str):
+        """Pop cached prefill layer activations for a completed request."""
+        return self.engine.pop_layer_activations(request_id)
+
+    async def clear_layer_activation_request(self, request_id: str) -> None:
+        self.engine.clear_layer_activation_request(request_id)
+
     async def apply_model(self, func):
         """Run a function directly on the model inside each worker."""
         return self.engine.model_executor.apply_model(func)

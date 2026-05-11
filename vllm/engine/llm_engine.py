@@ -231,6 +231,8 @@ class LLMEngine:
 
         # Hidden states cache for /v1/hidden_states endpoint
         self._hidden_states_cache: Dict[str, list] = {}
+        self._layer_activation_requests: Dict[str, dict] = {}
+        self._layer_activations_cache: Dict[str, dict] = {}
 
         if self.model_config.skip_tokenizer_init:
             self.tokenizer = None
@@ -868,6 +870,56 @@ class LLMEngine:
                     self._hidden_states_cache[
                         seq_group_meta.request_id
                     ] = sampler_output.hidden_states[i].cpu().tolist()
+
+            layer_activations = getattr(
+                sampler_output, 'prefill_layer_activations', None)
+            if layer_activations:
+                cursor = 0
+                for seq_group_meta in seq_group_metadata_list:
+                    chunk_size = int(seq_group_meta.token_chunk_size or 0)
+                    request_id_for_activation = seq_group_meta.request_id
+                    spec = self._layer_activation_requests.get(
+                        request_id_for_activation)
+                    if (spec is not None and seq_group_meta.is_prompt
+                            and chunk_size > 0):
+                        seq_data = next(iter(seq_group_meta.seq_data.values()))
+                        chunk_start = int(seq_data.get_num_computed_tokens())
+                        selected_positions = spec.get("positions")
+                        if selected_positions is None:
+                            selected_positions = list(
+                                range(chunk_start, chunk_start + chunk_size))
+                        else:
+                            selected_positions = [
+                                int(pos) for pos in selected_positions
+                                if chunk_start <= int(pos) <
+                                chunk_start + chunk_size
+                            ]
+                        local_indices = [
+                            pos - chunk_start for pos in selected_positions
+                        ]
+                        if local_indices:
+                            cache = self._layer_activations_cache.setdefault(
+                                request_id_for_activation,
+                                {
+                                    "activation": spec["activation"],
+                                    "layers": {},
+                                },
+                            )
+                            for kind, by_layer in layer_activations.items():
+                                if kind != spec["activation"]:
+                                    continue
+                                for layer_idx, values in by_layer.items():
+                                    layer_idx = int(layer_idx)
+                                    if layer_idx not in spec["layers"]:
+                                        continue
+                                    segment = values[cursor:cursor + chunk_size]
+                                    layer_cache = cache["layers"].setdefault(
+                                        str(layer_idx), {})
+                                    for pos, local_idx in zip(
+                                            selected_positions, local_indices):
+                                        layer_cache[str(pos)] = segment[
+                                            local_idx].detach().cpu().tolist()
+                    cursor += chunk_size
 
         # Determine the requests we need to operate on
         if request_id:
@@ -1622,6 +1674,29 @@ class LLMEngine:
     def pop_hidden_states(self, request_id: str) -> Optional[list]:
         """Pop cached hidden states for a request. Returns None if not found."""
         return self._hidden_states_cache.pop(request_id, None)
+
+    def register_layer_activation_request(
+        self,
+        request_id: str,
+        activation: str,
+        layers: List[int],
+        positions: Optional[List[int]] = None,
+    ) -> None:
+        self._layer_activation_requests[request_id] = {
+            "activation": activation,
+            "layers": {int(layer) for layer in layers},
+            "positions": None if positions is None else
+            [int(pos) for pos in positions],
+        }
+        self._layer_activations_cache.pop(request_id, None)
+
+    def pop_layer_activations(self, request_id: str) -> Optional[dict]:
+        self._layer_activation_requests.pop(request_id, None)
+        return self._layer_activations_cache.pop(request_id, None)
+
+    def clear_layer_activation_request(self, request_id: str) -> None:
+        self._layer_activation_requests.pop(request_id, None)
+        self._layer_activations_cache.pop(request_id, None)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_executor.add_lora(lora_request)

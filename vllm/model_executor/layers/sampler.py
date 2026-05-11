@@ -125,6 +125,10 @@ class SamplerOutput(
     # (used for models like EAGLE).
     prefill_hidden_states: Optional[torch.Tensor] = None
 
+    # Optional prefill layer activations captured for emissary span scoring.
+    prefill_layer_activations: Optional[
+        dict[str, dict[int, torch.Tensor]]] = None
+
     # Time taken in the forward pass for this across all workers
     model_forward_time: Optional[float] = None
 

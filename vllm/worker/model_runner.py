@@ -1668,6 +1668,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             model_forward_end = torch.cuda.Event(enable_timing=True)
             model_forward_start.record()
 
+        emissary_layer_activations = None
         if not bypass_model_exec:
             with set_forward_context(model_input.attn_metadata,
                                      self.vllm_config, virtual_engine):
@@ -1683,6 +1684,10 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                     **seqlen_agnostic_kwargs,
                     **model_kwargs,
                 )
+            pop_layer_activations = getattr(
+                self.model, "pop_emissary_layer_activations", None)
+            if callable(pop_layer_activations):
+                emissary_layer_activations = pop_layer_activations()
 
         if (self.observability_config is not None
                 and self.observability_config.collect_model_forward_time):
@@ -1794,6 +1799,9 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                 hidden_states = hidden_or_intermediate_states.index_select(
                     0, indices)
                 output.prefill_hidden_states = hidden_or_intermediate_states
+                if emissary_layer_activations:
+                    output.prefill_layer_activations = (
+                        emissary_layer_activations)
             elif decode_meta.use_cuda_graph:
                 hidden_states = hidden_or_intermediate_states[:len(indices)]
             else:
