@@ -421,6 +421,8 @@ class LoRAModel(AdapterModel):
             with safetensors.safe_open(lora_tensor_path,
                                        framework="pt") as f:  # type: ignore
                 for lora_module in f.keys():  # noqa
+                    if lora_module.startswith("base_model.model.regression."):
+                        continue
                     module_name, _, _ = parse_fine_tuned_lora_name(
                         lora_module, weights_mapper)
                     part_name = module_name.split(".")[-1]
