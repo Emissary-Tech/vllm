@@ -133,10 +133,6 @@ def parse_fine_tuned_lora_name(
         new_name = ".".join(parts[2:-1])
         return new_name, parts[-1] == "lora_embedding_A", False
 
-    if parts[-1] == "bias":
-        new_name = ".".join(parts[2:-2])
-        return new_name, False, True
-    
     if parts[-1] in {"weight", "bias"}:
         module = ".".join(parts[2:-1])  # drop 'base_model','model', keep module path
         is_bias = (parts[-1] == "bias")
