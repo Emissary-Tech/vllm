@@ -130,9 +130,21 @@ def _should_apply_chat_template(adapter_config: dict[str, Any]) -> bool:
     return _is_zero_shot_head(adapter_config)
 
 
+def _is_regression_zero_shot(adapter_config: dict[str, Any]) -> bool:
+    return (_is_zero_shot_head(adapter_config)
+            and adapter_config.get("task_type") == "regression")
+
+
 def _should_wrap_tool_server_prompt(adapter_config: dict[str, Any]) -> bool:
     return (_is_zero_shot_head(adapter_config)
             and adapter_config.get("prompt_format") == "tool_server_v1")
+
+
+def _format_regression_value(value: Any) -> str:
+    value = float(value)
+    if np.isfinite(value) and abs(value - round(value)) < 1e-9:
+        return str(int(round(value)))
+    return f"{value:.6g}"
 
 
 def _get_prompt_classes(adapter_config: dict[str, Any]) -> list[dict[str, Any]]:
@@ -145,6 +157,90 @@ def _get_prompt_classes(adapter_config: dict[str, Any]) -> list[dict[str, Any]]:
         return [{"name": str(label)} for label in labels]
 
     return []
+
+
+def _get_regression_spec(adapter_config: dict[str, Any]) -> dict[str, Any]:
+    spec = adapter_config.get("regression_spec")
+    if isinstance(spec, dict):
+        base = dict(spec)
+    else:
+        classes = _get_prompt_classes(adapter_config)
+        if not classes:
+            raise ValueError("Regression zero-shot adapter is missing both "
+                             "regression_spec and classes metadata.")
+        base = dict(classes[0])
+
+    name = str(base.get("name") or "").strip()
+    description = str(base.get("description") or "").strip()
+    if not name or not description:
+        raise ValueError("Regression zero-shot adapter requires name and "
+                         "description metadata.")
+
+    min_value = 0.0 if base.get("min_value") is None else float(
+        base["min_value"])
+    max_value = 1.0 if base.get("max_value") is None else float(
+        base["max_value"])
+    if max_value <= min_value:
+        raise ValueError("Regression zero-shot adapter requires max_value "
+                         "greater than min_value.")
+
+    return {
+        "name": name,
+        "description": description,
+        "min_value": min_value,
+        "max_value": max_value,
+        "low_description": base.get("low_description")
+        or f"minimum possible {name}",
+        "high_description": base.get("high_description")
+        or f"maximum possible {name}",
+        "higher_means": base.get("higher_means") or f"more {name}",
+    }
+
+
+def _wrap_regression_prompt(query: str, adapter_config: dict[str, Any]) -> str:
+    spec = _get_regression_spec(adapter_config)
+    return (
+        "You are a scalar scorer.\n\n"
+        f"[INPUT]\n{query}\n\n"
+        "Target:\n"
+        f"{spec['name']} - {spec['description']}\n\n"
+        "Scale:\n"
+        f"{_format_regression_value(spec['min_value'])} to "
+        f"{_format_regression_value(spec['max_value'])}.\n"
+        f"{_format_regression_value(spec['min_value'])} means "
+        f"{spec['low_description']}.\n"
+        f"{_format_regression_value(spec['max_value'])} means "
+        f"{spec['high_description']}.\n"
+        f"Higher values mean {spec['higher_means']}.\n\n"
+        "Return ONLY the numeric score.\n"
+        "Score:"
+    )
+
+
+def _wrap_zero_shot_prompt(query: str,
+                           adapter_config: dict[str, Any]) -> str:
+    if _is_regression_zero_shot(adapter_config):
+        return _wrap_regression_prompt(query, adapter_config)
+    if _should_wrap_tool_server_prompt(adapter_config):
+        return _wrap_tool_server_prompt(query, adapter_config)
+    return query
+
+
+def _maybe_clamp_regression_output(
+    output: PoolingOutput,
+    adapter_config: dict[str, Any],
+) -> PoolingOutput:
+    if not _is_regression_zero_shot(adapter_config):
+        return output
+
+    spec = _get_regression_spec(adapter_config)
+    min_value = float(spec["min_value"])
+    max_value = float(spec["max_value"])
+
+    clamped = output.data.to(dtype=torch.float32).clone()
+    clamped.clamp_(min=min_value, max=max_value)
+    output.data = clamped.to(dtype=output.data.dtype)
+    return output
 
 
 def _wrap_tool_server_prompt(query: str,
@@ -195,9 +291,7 @@ def _completion_input_to_chat_messages(
     adapter_config: dict[str, Any],
 ) -> Optional[list[list[dict[str, str]]]]:
     def wrap_content(content: str) -> str:
-        if _should_wrap_tool_server_prompt(adapter_config):
-            return _wrap_tool_server_prompt(content, adapter_config)
-        return content
+        return _wrap_zero_shot_prompt(content, adapter_config)
 
     if isinstance(input_data, str):
         return [[{"role": "user", "content": wrap_content(input_data)}]]
@@ -212,7 +306,8 @@ def _maybe_wrap_chat_messages(
     messages: list[dict[str, Any]],
     adapter_config: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    if not _should_wrap_tool_server_prompt(adapter_config):
+    if not (_should_wrap_tool_server_prompt(adapter_config)
+            or _is_regression_zero_shot(adapter_config)):
         return messages
     if len(messages) != 1:
         return messages
@@ -220,8 +315,8 @@ def _maybe_wrap_chat_messages(
     if message.get("role") != "user" or not isinstance(
             message.get("content"), str):
         return messages
-    message["content"] = _wrap_tool_server_prompt(message["content"],
-                                                  adapter_config)
+    message["content"] = _wrap_zero_shot_prompt(message["content"],
+                                                adapter_config)
     return [message]
 
 
@@ -415,6 +510,7 @@ class OpenAIServingClassify(OpenAIServing):
                 model_name,
                 encoding_format,
                 response_activation,
+                adapter_config,
             )
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
@@ -432,11 +528,14 @@ class OpenAIServingClassify(OpenAIServing):
         model_name: str,
         encoding_format: Literal["float", "base64"],
         response_activation: str,
+        adapter_config: dict[str, Any],
     ) -> ClassifyResponse:
         items: list[ClassifyResponseData] = []
         num_prompt_tokens = 0
 
         for idx, final_res in enumerate(final_res_batch):
+            final_res.outputs = _maybe_clamp_regression_output(
+                final_res.outputs, adapter_config)
             item = ClassifyResponseData(
                 index=idx,
                 logits=_get_data(final_res.outputs, encoding_format),

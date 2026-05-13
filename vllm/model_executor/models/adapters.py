@@ -208,6 +208,17 @@ def as_classification_model(cls: _T) -> _T:
             hidden_states = super().forward(input_ids, positions,
                                             intermediate_tensors,
                                             inputs_embeds)
+            regression_v_base = getattr(self,
+                                        "classification_head_regression_v_base",
+                                        None)
+            if regression_v_base is not None:
+                regression_v_base = regression_v_base.to(
+                    device=hidden_states.device, dtype=torch.float32)
+                hidden_states = F.normalize(hidden_states.float() -
+                                            regression_v_base,
+                                            dim=-1).to(self.score.weight.dtype)
+                logits, _ = self.score(hidden_states)
+                return logits
             if getattr(self, "classification_head_use_cosine", False):
                 tau = getattr(self, "classification_head_temperature", 40.0)
                 hidden_states = F.normalize(hidden_states.float(), dim=-1)

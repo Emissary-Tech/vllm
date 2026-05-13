@@ -38,6 +38,7 @@ from vllm.utils import is_pin_memory_available
 logger = init_logger(__name__)
 
 _GLOBAL_LORA_ID = 0
+REGRESSION_V_BASE_KEY = "base_model.model.regression.v_base"
 
 
 @dataclass
@@ -125,6 +126,8 @@ def _is_head_only_adapter(peft_helper: PEFTHelper,
             continue
         if key.endswith(("score.bias", "classifier.bias")):
             continue
+        if key == REGRESSION_V_BASE_KEY:
+            continue
         return False
 
     return has_head_weight
@@ -155,6 +158,7 @@ def _attach_classification_head(base_model, tensors: dict,
     # Find classification weight and bias in tensors
     weight_key = None
     bias_key = None
+    regression_v_base = tensors.get(REGRESSION_V_BASE_KEY)
     for key in tensors:
         if key.endswith("score.weight") or key.endswith("classifier.weight"):
             weight_key = key
@@ -222,8 +226,14 @@ def _attach_classification_head(base_model, tensors: dict,
                 logger.warning(f"Bias key {bias_key} found in adapter but model has no bias")
 
     head_only = _is_head_only_adapter(peft_helper, tensors)
+    if regression_v_base is not None:
+        base_model.classification_head_regression_v_base = regression_v_base.to(
+            device=device, dtype=torch.float32)
+    else:
+        base_model.classification_head_regression_v_base = None
     base_model.classification_head_use_cosine = (
-        head_only and (_head_output_size(tensors) or 0) > 1)
+        regression_v_base is None and head_only
+        and (_head_output_size(tensors) or 0) > 1)
     base_model.classification_head_temperature = 40.0
     
     logger.info(f"Successfully attached classification head with {num_labels} labels to the model")
@@ -297,6 +307,8 @@ class LoRAModel(AdapterModel):
         pin_memory = str(device) == "cpu" and is_pin_memory_available()
         loras: Dict[str, LoRALayerWeights] = {}
         for tensor_name, tensor in tensors.items():
+            if tensor_name.startswith("base_model.model.regression."):
+                continue
             module_name, is_lora_a, is_bias = parse_fine_tuned_lora_name(
                 tensor_name, weights_mapper)
             if module_name in {"score", "classifier", "lm_head", "embed_tokens","model.embed_tokens"}:
