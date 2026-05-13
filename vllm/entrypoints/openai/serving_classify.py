@@ -132,7 +132,9 @@ def _should_apply_chat_template(adapter_config: dict[str, Any]) -> bool:
 
 def _is_regression_zero_shot(adapter_config: dict[str, Any]) -> bool:
     return (_is_zero_shot_head(adapter_config)
-            and adapter_config.get("task_type") == "regression")
+            and (adapter_config.get("mode") == "regression"
+                 or adapter_config.get("sub_task_type") == "regression"
+                 or isinstance(adapter_config.get("regression_spec"), dict)))
 
 
 def _should_wrap_tool_server_prompt(adapter_config: dict[str, Any]) -> bool:
