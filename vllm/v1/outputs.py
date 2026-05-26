@@ -243,6 +243,10 @@ class ModelRunnerOutput:
     # [num_reqs, hidden_size]
     pooler_output: list[torch.Tensor | None] | None = None
 
+    # [num_reqs, hidden_size]. Optional last-token hidden states for
+    # external classification heads.
+    hidden_states: list[list[float] | None] | None = None
+
     kv_connector_output: KVConnectorOutput | None = None
 
     ec_connector_output: ECConnectorOutput | None = None

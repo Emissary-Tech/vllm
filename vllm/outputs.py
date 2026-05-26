@@ -104,6 +104,8 @@ class RequestOutput:
                                   None if decoder-only.
         num_cached_tokens: The number of tokens with prefix cache hit.
         kv_transfer_params: The params for remote K/V transfer.
+        hidden_state: Optional last-token hidden state from the model forward
+            pass. This is populated only when enabled by the server.
     """
 
     def __init__(
@@ -121,6 +123,7 @@ class RequestOutput:
         num_cached_tokens: int | None = None,
         *,
         kv_transfer_params: dict[str, Any] | None = None,
+        hidden_state: list[float] | None = None,
         # Forward compatibility, code that uses args added in new release can
         # still run with older versions of vLLM without breaking.
         **kwargs: Any,
@@ -141,12 +144,15 @@ class RequestOutput:
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
         self.num_cached_tokens = num_cached_tokens
         self.kv_transfer_params = kv_transfer_params
+        self.hidden_state = hidden_state
 
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         """Merge subsequent RequestOutput into this one"""
 
         self.finished |= next_output.finished
         self.kv_transfer_params = next_output.kv_transfer_params
+        if next_output.hidden_state is not None:
+            self.hidden_state = next_output.hidden_state
 
         for next_completion in next_output.outputs:
             for i, completion in enumerate(self.outputs):

@@ -189,6 +189,12 @@ def build_app(
 
     register_vllm_serve_api_routers(app)
 
+    from vllm.entrypoints.serve.emissary.api_router import (
+        attach_router as attach_emissary_router,
+    )
+
+    attach_emissary_router(app)
+
     from vllm.entrypoints.openai.models.api_router import (
         attach_router as register_models_api_router,
     )

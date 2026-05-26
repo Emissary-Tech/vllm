@@ -116,6 +116,50 @@ class WorkerBase:
         """Apply a function on the model inside this worker."""
         return fn(self.get_model())
 
+    def get_lm_head_weights(self, token_ids: list[int]) -> list[list[float]] | None:
+        """Return lm_head rows for external classification heads."""
+        model = self.get_model()
+        candidates: list[nn.Module | None] = [model]
+        for attr in ("language_model", "model", "llm", "base_model"):
+            module = getattr(model, attr, None)
+            if isinstance(module, nn.Module):
+                candidates.append(module)
+                nested = getattr(module, "language_model", None)
+                if isinstance(nested, nn.Module):
+                    candidates.append(nested)
+
+        lm_head = None
+        for module in candidates:
+            if module is None:
+                continue
+            lm_head = getattr(module, "lm_head", None)
+            if lm_head is not None:
+                break
+
+        if lm_head is None:
+            for _, module in model.named_modules():
+                if module.__class__.__name__ == "ParallelLMHead":
+                    lm_head = module
+                    break
+
+        if lm_head is None:
+            return None
+
+        weight = getattr(lm_head, "weight", None)
+        try:
+            device = weight.device if weight is not None else next(
+                lm_head.parameters()).device
+            input_ids = torch.tensor(token_ids, dtype=torch.long, device=device)
+            with torch.inference_mode():
+                rows = lm_head(input_ids)
+        except Exception:
+            if weight is None:
+                return None
+            rows = weight.data[token_ids]
+
+        rows = rows.detach().float().cpu()
+        return rows.tolist()
+
     def get_model_inspection(self) -> str:
         """Return a transformers-style hierarchical view of the model."""
         from vllm.model_inspection import format_model_inspection

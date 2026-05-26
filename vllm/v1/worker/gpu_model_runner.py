@@ -4035,6 +4035,18 @@ class GPUModelRunner(
                 spec_decode_metadata,
             )
 
+        hidden_states_output = None
+        if self.model_config.return_hidden_states:
+            num_output_reqs = len(req_ids_output_copy)
+            if sample_hidden_states.shape[0] >= num_output_reqs:
+                hidden_states_output = (
+                    sample_hidden_states[:num_output_reqs]
+                    .detach()
+                    .float()
+                    .cpu()
+                    .tolist()
+                )
+
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
             # tokens on the CPU, so they are run after bookkeeping.
@@ -4067,6 +4079,7 @@ class GPUModelRunner(
                 sampled_token_ids=valid_sampled_token_ids,
                 logprobs=logprobs_lists,
                 prompt_logprobs_dict=prompt_logprobs_dict,
+                hidden_states=hidden_states_output,
                 kv_connector_output=kv_connector_output,
                 ec_connector_output=ec_connector_output
                 if self.supports_mm_inputs

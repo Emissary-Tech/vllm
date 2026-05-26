@@ -151,6 +151,10 @@ class EngineCoreOutput(
 
     pooling_output: torch.Tensor | None = None
 
+    # Last-token hidden state from the model forward pass. This is only set
+    # when ModelConfig.return_hidden_states is enabled.
+    hidden_state: list[float] | None = None
+
     finish_reason: FinishReason | None = None
     stop_reason: int | str | None = None
     events: list[EngineCoreEvent] | None = None

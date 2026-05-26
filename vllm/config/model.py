@@ -270,6 +270,11 @@ class ModelConfig:
     enable_sleep_mode: bool = False
     """Enable sleep mode for the engine (only cuda and
     hip platforms are supported)."""
+    return_hidden_states: bool = False
+    """Return last-token hidden states from generation requests.
+
+    This is used by emissary classification gateways that attach external
+    scoring heads to a generative or multimodal model."""
     model_impl: str | ModelImpl = "auto"
     """Which implementation of the model to use:\n
     - "auto" will try to use the vLLM implementation, if it exists, and fall
@@ -341,6 +346,7 @@ class ModelConfig:
             "config_format",
             "hf_token",
             "hf_overrides",
+            "return_hidden_states",
             "override_attention_dtype",
             "logits_processors",
             "io_processor_plugin",

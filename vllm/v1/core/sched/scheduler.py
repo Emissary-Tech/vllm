@@ -1282,6 +1282,7 @@ class Scheduler(SchedulerInterface):
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
+        hidden_states = model_runner_output.hidden_states
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
@@ -1365,6 +1366,7 @@ class Scheduler(SchedulerInterface):
             new_logprobs = None
             new_token_ids = generated_token_ids
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
+            hidden_state = hidden_states[req_index] if hidden_states else None
             kv_transfer_params = None
             status_before_stop = request.status
 
@@ -1435,6 +1437,7 @@ class Scheduler(SchedulerInterface):
                         new_logprobs=new_logprobs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
                         pooling_output=pooler_output,
+                        hidden_state=hidden_state,
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
                         kv_transfer_params=kv_transfer_params,
