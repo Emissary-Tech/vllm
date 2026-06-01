@@ -25,6 +25,7 @@ from vllm.lora.punica_wrapper import get_punica_wrapper
 from vllm.lora.utils import (from_layer, from_layer_logits_processor,
                              get_supported_lora_modules,
                              is_regex_target_modules,
+                             parse_fine_tuned_classifier_name,
                              parse_fine_tuned_lora_name, replace_submodule)
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
@@ -215,8 +216,14 @@ class LoRAModel(AdapterModel):
         tensors: dict[str, torch.Tensor] = {}
         unexpected_modules: list[Union[list[str], str]] = []
 
+        def is_classifier_head_tensor(name: str) -> bool:
+            return parse_fine_tuned_classifier_name(
+                name, weights_mapper) is not None
+
         def check_unexpected_modules(modules: dict):
             for lora_module in modules.keys():  # noqa
+                if is_classifier_head_tensor(lora_module):
+                    continue
                 module_name, _, _ = parse_fine_tuned_lora_name(
                     lora_module, weights_mapper)
                 part_name = module_name.split(".")[-1]
@@ -241,6 +248,11 @@ class LoRAModel(AdapterModel):
                 dtype=tensorizer_config.dtype,
                 **tensorizer_args.deserialization_kwargs)
             check_unexpected_modules(tensors)
+            tensors = {
+                module: tensor
+                for module, tensor in tensors.items()
+                if not is_classifier_head_tensor(module)
+            }
 
         elif os.path.isfile(lora_tensor_path):
             # Find unexpected modules.
@@ -255,6 +267,11 @@ class LoRAModel(AdapterModel):
                 # Load tensors if there are only expected modules.
                 check_unexpected_modules(f)
                 for module in f.keys():  # noqa
+                    if is_classifier_head_tensor(module):
+                        logger.info_once(
+                            "Ignoring sequence classification head tensor "
+                            "%s while loading LoRA backbone weights.", module)
+                        continue
                     tensors[module] = f.get_tensor(module)
         elif os.path.isfile(lora_bin_file_path) or os.path.isfile(
                 lora_pt_file_path):
@@ -287,6 +304,11 @@ class LoRAModel(AdapterModel):
             tensors = torch.load(lora_file_path,
                                  map_location=device,
                                  weights_only=True)
+            tensors = {
+                module: tensor
+                for module, tensor in tensors.items()
+                if not is_classifier_head_tensor(module)
+            }
         else:
             raise ValueError(f"{lora_dir} doesn't contain tensors")
 

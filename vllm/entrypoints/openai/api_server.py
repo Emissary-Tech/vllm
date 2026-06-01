@@ -1182,6 +1182,69 @@ async def get_lm_head_weights(raw_request: Request):
     return JSONResponse(content={"weights": results[0]})
 
 
+def _optional_body_str(body: dict[str, Any], *keys: str) -> Optional[str]:
+    for key in keys:
+        value = body.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value.strip():
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=f"'{key}' must be a non-empty string when provided")
+        return value.strip()
+    return None
+
+
+def _default_lora_name_from_path(lora_path: str) -> str:
+    path = lora_path.rstrip("/").rstrip("\\")
+    name = os.path.basename(path)
+    return name or f"hidden-states-lora-{uuid.uuid4().hex}"
+
+
+async def _resolve_hidden_states_lora(raw_request: Request,
+                                      body: dict[str, Any]):
+    """Resolve or load the LoRA adapter requested by hidden-state endpoints."""
+    lora_path = _optional_body_str(body, "lora_path")
+    lora_name = _optional_body_str(body, "lora_name", "lora",
+                                   "adapter_name")
+    model_name = _optional_body_str(body, "model")
+
+    serving_models = models(raw_request)
+
+    if lora_path:
+        resolved_name = lora_name or model_name
+        if not resolved_name or serving_models.is_base_model(resolved_name):
+            resolved_name = _default_lora_name_from_path(lora_path)
+
+        loaded_lora = serving_models.lora_requests.get(resolved_name)
+        if loaded_lora is not None:
+            if loaded_lora.lora_path != lora_path:
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                    detail=(f"LoRA adapter '{resolved_name}' is already "
+                            f"loaded from '{loaded_lora.lora_path}', not "
+                            f"'{lora_path}'. Use a different lora_name."))
+            return loaded_lora
+
+        load_result = await serving_models.load_lora_adapter(
+            LoadLoRAAdapterRequest(lora_name=resolved_name,
+                                   lora_path=lora_path))
+        if isinstance(load_result, ErrorResponse):
+            raise HTTPException(status_code=load_result.error.code,
+                                detail=load_result.error.message)
+        return serving_models.lora_requests[resolved_name]
+
+    resolved_name = lora_name or model_name
+    if not resolved_name or serving_models.is_base_model(resolved_name):
+        return None
+
+    resolved_lora = await serving_models.resolve_lora(resolved_name)
+    if isinstance(resolved_lora, ErrorResponse):
+        raise HTTPException(status_code=resolved_lora.error.code,
+                            detail=resolved_lora.error.message)
+    return resolved_lora
+
+
 @router.post("/v1/hidden_states")
 async def get_hidden_states(raw_request: Request):
     """Get the last-token hidden state (pre-lm_head) for a prompt.
@@ -1213,9 +1276,13 @@ async def get_hidden_states(raw_request: Request):
 
     request_id = f"hs-{uuid.uuid4().hex}"
     sampling_params = SamplingParams(max_tokens=1, temperature=0)
+    lora_request = await _resolve_hidden_states_lora(raw_request, body)
 
     # Generate 1 token to trigger forward pass → hidden states cached
-    async for output in client.generate(prompt, sampling_params, request_id):
+    async for output in client.generate(prompt,
+                                        sampling_params,
+                                        request_id,
+                                        lora_request=lora_request):
         final_output = output  # noqa: F841
 
     # Read cached hidden states
@@ -1264,10 +1331,14 @@ async def get_hidden_states_batch(raw_request: Request):
         return JSONResponse(content={"hidden_states": []})
 
     sampling_params = SamplingParams(max_tokens=1, temperature=0)
+    lora_request = await _resolve_hidden_states_lora(raw_request, body)
 
     async def _one(prompt: str):
         request_id = f"hs-{uuid.uuid4().hex}"
-        async for _ in client.generate(prompt, sampling_params, request_id):
+        async for _ in client.generate(prompt,
+                                       sampling_params,
+                                       request_id,
+                                       lora_request=lora_request):
             pass
         return await client.get_hidden_states(request_id)
 

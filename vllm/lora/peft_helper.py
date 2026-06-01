@@ -45,7 +45,23 @@ class PEFTHelper:
         """
         error_msg = []
         if self.modules_to_save:
-            error_msg.append("vLLM only supports modules_to_save being None.")
+            modules_to_save = self.modules_to_save
+            if isinstance(modules_to_save, str):
+                modules_to_save = [modules_to_save]
+            unsupported_modules = [
+                module_name for module_name in modules_to_save
+                if module_name.split(".")[-1] not in {"score", "classifier"}
+            ]
+            if unsupported_modules:
+                error_msg.append(
+                    "vLLM only supports modules_to_save for sequence "
+                    "classification heads (`score` or `classifier`). "
+                    f"Unsupported modules: {unsupported_modules}.")
+            else:
+                logger.info_once(
+                    "Ignoring sequence classification modules_to_save %s "
+                    "while loading LoRA backbone weights.",
+                    modules_to_save)
         if self.use_dora:
             error_msg.append("vLLM does not yet support DoRA.")
         return error_msg
