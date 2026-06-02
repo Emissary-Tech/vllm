@@ -90,10 +90,18 @@ class WorkerLoRAManager(AbstractWorkerManager):
             packed_modules_mapping = (
                 self._adapter_manager.packed_modules_mapping)
             expected_lora_modules: list[str] = []
-            for module in supported_lora_modules:
+
+            def iter_module_names(values: Any):
+                for value in values:
+                    if isinstance(value, list):
+                        yield from iter_module_names(value)
+                    elif value is not None:
+                        yield str(value)
+
+            for module in iter_module_names(supported_lora_modules):
                 if module in packed_modules_mapping:
                     expected_lora_modules.extend(
-                        packed_modules_mapping[module])
+                        iter_module_names(packed_modules_mapping[module]))
                 else:
                     expected_lora_modules.append(module)
 
