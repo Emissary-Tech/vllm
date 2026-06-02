@@ -80,7 +80,7 @@ class PEFTHelper:
                 logger.info_once(
                     "Ignoring sequence classification modules_to_save %s "
                     "while loading LoRA backbone weights.",
-                    modules_to_save)
+                    tuple(modules_to_save))
         if self.use_dora:
             error_msg.append("vLLM does not yet support DoRA.")
         return error_msg
