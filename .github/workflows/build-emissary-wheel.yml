@@ -110,6 +110,20 @@ jobs:
           echo "Built artifacts:"
           ls -lh dist/
 
+      - name: Retag wheel as cp38-abi3 (stable ABI)
+        run: |
+          set -euo pipefail
+          # The precompiled path skips build_ext, so bdist_wheel tags the wheel
+          # for the build interpreter (cp312) instead of cp38-abi3. The bundled
+          # *.abi3.so are stable-ABI (extracted from upstream's cp38-abi3 wheel),
+          # so retagging to cp38-abi3 is correct and lets one wheel install on
+          # CPython 3.8+ (incl. the 3.10 serving venv). --remove drops the
+          # original so exactly one wheel remains in dist/.
+          BEFORE="$(ls dist/*.whl)"
+          echo "Built tag: $(basename "$BEFORE")"
+          .venv/bin/python -m wheel tags --remove --python-tag cp38 --abi-tag abi3 "$BEFORE"
+          echo "Retagged to: $(basename "$(ls dist/*.whl)")"
+
       - name: Sanity-check the wheel contains the CUDA .so files
         run: |
           set -euo pipefail
