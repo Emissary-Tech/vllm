@@ -81,11 +81,19 @@ jobs:
         run: |
           set -euo pipefail
           uv venv --python 3.12 .venv
-          # CPU torch is enough: precompiled build never invokes nvcc.
+          # Must use the CUDA torch build (not CPU): setup.py's _is_cuda() gates
+          # on `torch.version.cuda is not None`, which is unset in CPU torch and
+          # makes get_requirements() raise "Unsupported platform". The CUDA wheel
+          # installs fine on a GPU-less runner; we still never call nvcc because
+          # VLLM_USE_PRECOMPILED=1 skips all compilation.
+          # Plain torch from default PyPI = the CUDA build on linux x86_64
+          # (sets torch.version.cuda). Do NOT pass --torch-backend=auto here:
+          # on a GPU-less runner it would resolve to the CPU build and break
+          # _is_cuda(). No GPU is required to install the CUDA wheel.
           uv pip install --python .venv/bin/python \
             "setuptools>=77.0.3,<81.0.0" "setuptools-scm>=8" wheel build \
-            packaging jinja2 ninja "cmake>=3.26.1" \
-            "torch==2.10.0" --torch-backend=cpu
+            packaging jinja2 ninja "cmake>=3.26.1" numpy \
+            "torch==2.10.0"
 
       - name: Build precompiled wheel
         env:
