@@ -1,0 +1,147 @@
+name: Build Emissary vLLM wheel
+
+# Builds a self-contained, pre-compiled wheel of this fork (feature/gemma4-cls)
+# and publishes it as a GitHub Release asset. The wheel bundles the upstream
+# precompiled CUDA .so files (via VLLM_USE_PRECOMPILED) on top of our Python
+# customizations, so installing it at serve time requires NO build step:
+#
+#   uv pip install <release-asset-url>
+#
+# No GPU is needed to build: VLLM_USE_PRECOMPILED=1 skips nvcc and just
+# downloads + bundles the prebuilt .so from wheels.vllm.ai. We force
+# VLLM_TARGET_DEVICE=cuda because the runner has no GPU to auto-detect.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "PEP 440 version to stamp into the wheel (VLLM_VERSION_OVERRIDE)"
+        required: true
+        default: "0.11.2+emissary.gemma4cls"
+      precompiled_commit:
+        description: "Upstream vLLM commit whose precompiled wheel to bundle"
+        required: true
+        default: "2a69949bdadf0e8942b7a1619b229cb475beef20"
+      precompiled_variant:
+        description: "CUDA variant on wheels.vllm.ai (e.g. cu129)"
+        required: true
+        default: "cu129"
+      release_tag:
+        description: "Git tag / release name to publish under"
+        required: true
+        default: "emissary-gemma4cls"
+  push:
+    tags:
+      - "emissary-v*"
+
+permissions:
+  contents: write  # needed to create/update the GitHub Release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so setuptools-scm is happy
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Resolve build parameters
+        id: params
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # Tag push: derive version from the tag (strip "emissary-v" prefix)
+            TAG="${GITHUB_REF_NAME}"
+            VERSION="${TAG#emissary-v}+emissary.gemma4cls"
+            RELEASE_TAG="${TAG}"
+            COMMIT="2a69949bdadf0e8942b7a1619b229cb475beef20"
+            VARIANT="cu129"
+          else
+            VERSION="${{ github.event.inputs.version }}"
+            RELEASE_TAG="${{ github.event.inputs.release_tag }}"
+            COMMIT="${{ github.event.inputs.precompiled_commit }}"
+            VARIANT="${{ github.event.inputs.precompiled_variant }}"
+          fi
+          # Keep the version deterministic so the serving-side install command
+          # is a stable constant. Traceability comes from the release tag/notes
+          # and the embedded git SHA below, not from the version string.
+          echo "version=$VERSION"           >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG"   >> "$GITHUB_OUTPUT"
+          echo "commit=$COMMIT"             >> "$GITHUB_OUTPUT"
+          echo "variant=$VARIANT"           >> "$GITHUB_OUTPUT"
+
+      - name: Set up build environment
+        run: |
+          set -euo pipefail
+          uv venv --python 3.12 .venv
+          # CPU torch is enough: precompiled build never invokes nvcc.
+          uv pip install --python .venv/bin/python \
+            "setuptools>=77.0.3,<81.0.0" "setuptools-scm>=8" wheel build \
+            packaging jinja2 ninja "cmake>=3.26.1" \
+            "torch==2.10.0" --torch-backend=cpu
+
+      - name: Build precompiled wheel
+        env:
+          VLLM_USE_PRECOMPILED: "1"
+          VLLM_TARGET_DEVICE: "cuda"   # runner has no GPU; force CUDA target
+          VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX: "1"  # keep version exactly as overridden
+          VLLM_PRECOMPILED_WHEEL_COMMIT: ${{ steps.params.outputs.commit }}
+          VLLM_PRECOMPILED_WHEEL_VARIANT: ${{ steps.params.outputs.variant }}
+          VLLM_VERSION_OVERRIDE: ${{ steps.params.outputs.version }}
+          HF_XET_HIGH_PERFORMANCE: "1"
+        run: |
+          set -euo pipefail
+          .venv/bin/python -m build --wheel --no-isolation --outdir dist/
+          echo "Built artifacts:"
+          ls -lh dist/
+
+      - name: Sanity-check the wheel contains the CUDA .so files
+        run: |
+          set -euo pipefail
+          WHEEL="$(ls dist/*.whl)"
+          echo "Inspecting $WHEEL"
+          # These must be present or the wheel is a broken CPU build.
+          .venv/bin/python - "$WHEEL" <<'PY'
+          import sys, zipfile
+          required = [
+              "vllm/_C.abi3.so",
+              "vllm/_moe_C.abi3.so",
+              "vllm/cumem_allocator.abi3.so",
+              "vllm/vllm_flash_attn/_vllm_fa2_C.abi3.so",
+          ]
+          names = set(zipfile.ZipFile(sys.argv[1]).namelist())
+          missing = [r for r in required if r not in names]
+          if missing:
+              print("MISSING from wheel:", missing)
+              sys.exit(1)
+          print("OK: all required compiled extensions present")
+          PY
+
+      - name: Upload wheel as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: emissary-vllm-wheel
+          path: dist/*.whl
+
+      - name: Publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.params.outputs.release_tag }}"
+          # Create the release if it does not exist yet, then upload (clobbering
+          # any same-named asset so re-runs are idempotent).
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --title "Emissary vLLM ($TAG)" \
+              --notes "Pre-compiled wheel of fork feature/gemma4-cls @ ${{ steps.params.outputs.sha }}. Version: ${{ steps.params.outputs.version }}. Bundles upstream precompiled commit ${{ steps.params.outputs.commit }} (${{ steps.params.outputs.variant }})."
+          fi
+          gh release upload "$TAG" dist/*.whl --clobber
+          echo "Published wheel to release: $TAG"
