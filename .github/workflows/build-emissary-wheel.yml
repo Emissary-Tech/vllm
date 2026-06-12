@@ -98,6 +98,14 @@ jobs:
           HF_XET_HIGH_PERFORMANCE: "1"
         run: |
           set -euo pipefail
+          # Build under the canonical distribution name "vllm". vLLM detects its
+          # platform/device by calling importlib.metadata.version("vllm")
+          # (platforms/__init__.py: cuda_platform_plugin -> vllm_version_matches_substr).
+          # If the distribution is named "vllm-emissary", that lookup raises
+          # PackageNotFoundError and CUDA detection fails ("Failed to infer
+          # device type") even on a GPU host. Import name is unaffected.
+          sed -i 's/^name = "vllm-emissary"$/name = "vllm"/' pyproject.toml
+          grep -n '^name = ' pyproject.toml
           .venv/bin/python -m build --wheel --no-isolation --outdir dist/
           echo "Built artifacts:"
           ls -lh dist/
