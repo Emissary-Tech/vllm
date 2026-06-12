@@ -102,6 +102,62 @@ jobs:
           echo "Built artifacts:"
           ls -lh dist/
 
+      - name: Inject precompiled binaries into the wheel
+        run: |
+          set -euo pipefail
+          # setup.py's repackage_wheel runs as build_ext, which setuptools
+          # executes AFTER build_py has already copied package_data -> the .so it
+          # extracts never land in a clean `python -m build` wheel. So we inject
+          # the same files repackage_wheel intends (the abi3 .so + the flash-attn
+          # .py that ship from the precompiled wheel) directly into the built
+          # wheel, then repack so RECORD is recomputed.
+          BASE_URL="${{ steps.params.outputs.wheel_location }}"
+          curl -fSL --retry 3 -o /tmp/base.whl "$BASE_URL"
+          OUR="$(ls dist/*.whl)"
+          rm -rf /tmp/unpack && mkdir -p /tmp/unpack
+          .venv/bin/python -m wheel unpack "$OUR" -d /tmp/unpack
+          DESTDIR="$(ls -d /tmp/unpack/*/)"
+          .venv/bin/python - /tmp/base.whl "$DESTDIR" <<'PY'
+          import sys, zipfile, os, shutil
+          base, dest = sys.argv[1], sys.argv[2]
+          # Mirror repackage_wheel's files_to_copy exactly.
+          wanted = [
+              "vllm/_C.abi3.so",
+              "vllm/_moe_C.abi3.so",
+              "vllm/_flashmla_C.abi3.so",
+              "vllm/vllm_flash_attn/_vllm_fa2_C.abi3.so",
+              "vllm/vllm_flash_attn/_vllm_fa3_C.abi3.so",
+              "vllm/vllm_flash_attn/flash_attn_interface.py",
+              "vllm/vllm_flash_attn/__init__.py",
+              "vllm/cumem_allocator.abi3.so",
+          ]
+          z = zipfile.ZipFile(base)
+          names = set(z.namelist())
+          copied = []
+          for w in wanted:
+              if w not in names:
+                  print("skip (not in base wheel):", w)
+                  continue
+              target = os.path.join(dest, w)
+              os.makedirs(os.path.dirname(target), exist_ok=True)
+              with z.open(w) as src, open(target, "wb") as out:
+                  shutil.copyfileobj(src, out)
+              copied.append(w)
+          print("Injected:", copied)
+          required = [
+              "vllm/_C.abi3.so",
+              "vllm/_moe_C.abi3.so",
+              "vllm/cumem_allocator.abi3.so",
+              "vllm/vllm_flash_attn/_vllm_fa2_C.abi3.so",
+          ]
+          missing = [r for r in required if r not in copied]
+          assert not missing, f"base wheel is missing required extensions: {missing}"
+          PY
+          rm -f dist/*.whl
+          .venv/bin/python -m wheel pack "$DESTDIR" -d dist/
+          echo "Repacked with binaries:"
+          ls -lh dist/
+
       - name: Retag wheel as cp38-abi3 (stable ABI)
         run: |
           set -euo pipefail
