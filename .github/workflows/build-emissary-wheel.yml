@@ -1,0 +1,171 @@
+name: Build Emissary vLLM wheel
+
+# Builds a self-contained, pre-compiled wheel of this fork
+# (feature/classification-new, emissary classification on top of vLLM 0.18.0)
+# and publishes it as a GitHub Release asset, so serving can install it with NO
+# build step:
+#
+#   uv pip install --find-links <release-page> "vllm==<version>"
+#
+# This branch uses the 0.19-style precompiled mechanism (precompiled_build_ext +
+# wheels.vllm.ai/{commit}/{variant}/ + metadata.json), same as feature/gemma4-cls:
+#   * base wheel pinned via VLLM_PRECOMPILED_WHEEL_COMMIT + _VARIANT;
+#   * version set via VLLM_VERSION_OVERRIDE, with VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX
+#     to keep it exactly as given;
+#   * distribution name is "vllm" (do NOT rename it: vLLM's platform detection
+#     calls importlib.metadata.version("vllm") and breaks otherwise).
+#
+# No GPU is needed: VLLM_USE_PRECOMPILED=1 downloads + bundles the prebuilt .so
+# (skips nvcc). We force VLLM_TARGET_DEVICE=cuda (runner has no GPU to detect)
+# and use the CUDA torch build so setup.py's _is_cuda() (gated on
+# torch.version.cuda) passes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "PEP 440 version to stamp into the wheel (VLLM_VERSION_OVERRIDE)"
+        required: true
+        default: "0.18.0+emissary.clsnew"
+      precompiled_commit:
+        description: "Upstream vLLM commit whose precompiled wheel to bundle"
+        required: true
+        default: "bcf2be96120005e9aea171927f85055a6a5c0cf6"
+      precompiled_variant:
+        description: "CUDA variant on wheels.vllm.ai (e.g. cu129)"
+        required: true
+        default: "cu129"
+      release_tag:
+        description: "Git tag / release name to publish under"
+        required: true
+        default: "emissary-clsnew-v0.18.0"
+  push:
+    tags:
+      - "emissary-clsnew-v*"
+
+permissions:
+  contents: write  # needed to create/update the GitHub Release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Resolve build parameters
+        id: params
+        run: |
+          set -euo pipefail
+          DEFAULT_COMMIT="bcf2be96120005e9aea171927f85055a6a5c0cf6"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF_NAME}"
+            NUM="$(printf '%s' "${TAG#emissary-clsnew-v}" | grep -oE '^[0-9]+(\.[0-9]+)*')"
+            if [ -z "$NUM" ]; then
+              echo "Tag '$TAG' has no leading X.Y.Z after 'emissary-clsnew-v'" >&2
+              exit 1
+            fi
+            VERSION="${NUM}+emissary.clsnew"
+            RELEASE_TAG="${TAG}"
+            COMMIT="$DEFAULT_COMMIT"
+            VARIANT="cu129"
+          else
+            VERSION="${{ github.event.inputs.version }}"
+            RELEASE_TAG="${{ github.event.inputs.release_tag }}"
+            COMMIT="${{ github.event.inputs.precompiled_commit }}"
+            VARIANT="${{ github.event.inputs.precompiled_variant }}"
+          fi
+          echo "version=$VERSION"           >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG"   >> "$GITHUB_OUTPUT"
+          echo "commit=$COMMIT"             >> "$GITHUB_OUTPUT"
+          echo "variant=$VARIANT"           >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up build environment
+        run: |
+          set -euo pipefail
+          uv venv --python 3.12 .venv
+          # Plain torch from default PyPI = the CUDA build on linux x86_64
+          # (sets torch.version.cuda). Do NOT use --torch-backend=auto: on a
+          # GPU-less runner it resolves to the CPU build and breaks _is_cuda().
+          # torch 2.10.0 matches this branch's pyproject build requirement.
+          uv pip install --python .venv/bin/python \
+            "setuptools>=77.0.3,<81.0.0" "setuptools-scm>=8" wheel build \
+            packaging jinja2 ninja "cmake>=3.26.1" numpy \
+            "torch==2.10.0"
+
+      - name: Build precompiled wheel
+        env:
+          VLLM_USE_PRECOMPILED: "1"
+          VLLM_TARGET_DEVICE: "cuda"   # runner has no GPU; force CUDA target
+          VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX: "1"  # keep version exactly as overridden
+          VLLM_PRECOMPILED_WHEEL_COMMIT: ${{ steps.params.outputs.commit }}
+          VLLM_PRECOMPILED_WHEEL_VARIANT: ${{ steps.params.outputs.variant }}
+          VLLM_VERSION_OVERRIDE: ${{ steps.params.outputs.version }}
+          HF_XET_HIGH_PERFORMANCE: "1"
+        run: |
+          set -euo pipefail
+          .venv/bin/python -m build --wheel --no-isolation --outdir dist/
+          echo "Built artifacts:"
+          ls -lh dist/
+
+      - name: Retag wheel as cp38-abi3 (stable ABI)
+        run: |
+          set -euo pipefail
+          # The precompiled path skips build_ext, so bdist_wheel tags the wheel
+          # for the build interpreter (cp312) instead of cp38-abi3. The bundled
+          # *.abi3.so are stable-ABI (from upstream's cp38-abi3 wheel), so
+          # retagging to cp38-abi3 is correct and lets one wheel install on
+          # CPython 3.8+ (incl. the serving venv).
+          BEFORE="$(ls dist/*.whl)"
+          echo "Built tag: $(basename "$BEFORE")"
+          .venv/bin/python -m wheel tags --remove --python-tag cp38 --abi-tag abi3 "$BEFORE"
+          echo "Retagged to: $(basename "$(ls dist/*.whl)")"
+
+      - name: Sanity-check the wheel contains the CUDA .so files
+        run: |
+          set -euo pipefail
+          WHEEL="$(ls dist/*.whl)"
+          echo "Inspecting $WHEEL"
+          .venv/bin/python - "$WHEEL" <<'PY'
+          import sys, zipfile
+          required = [
+              "vllm/_C.abi3.so",
+              "vllm/_moe_C.abi3.so",
+              "vllm/cumem_allocator.abi3.so",
+              "vllm/vllm_flash_attn/_vllm_fa2_C.abi3.so",
+          ]
+          names = set(zipfile.ZipFile(sys.argv[1]).namelist())
+          missing = [r for r in required if r not in names]
+          if missing:
+              print("MISSING from wheel:", missing)
+              sys.exit(1)
+          print("OK: all required compiled extensions present")
+          PY
+
+      - name: Upload wheel as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: emissary-vllm-wheel
+          path: dist/*.whl
+
+      - name: Publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.params.outputs.release_tag }}"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --title "Emissary vLLM classification ($TAG)" \
+              --notes "Pre-compiled wheel of fork feature/classification-new @ ${{ steps.params.outputs.sha }}. Version: ${{ steps.params.outputs.version }}. Bundles upstream precompiled commit ${{ steps.params.outputs.commit }} (${{ steps.params.outputs.variant }})."
+          fi
+          gh release upload "$TAG" dist/*.whl --clobber
+          echo "Published wheel to release: $TAG"
