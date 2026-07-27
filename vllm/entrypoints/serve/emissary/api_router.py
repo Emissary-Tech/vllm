@@ -2,17 +2,24 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import os
 import uuid
 from http import HTTPStatus
 from typing import Any
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from typing_extensions import Never
 
+import vllm.envs as envs
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.chat_utils import load_chat_template
+from vllm.entrypoints.openai.engine.protocol import ErrorResponse
+from vllm.entrypoints.openai.models.api_router import models
 from vllm.entrypoints.openai.utils import validate_json_request
+from vllm.entrypoints.serve.lora.protocol import LoadLoRAAdapterRequest
 from vllm.inputs.data import ProcessorInputs, PromptType
+from vllm.lora.request import LoRARequest
 from vllm.renderers import ChatParams, TokenizeParams, merge_kwargs
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
@@ -71,6 +78,104 @@ def _prompt_extras(body: dict[str, Any]) -> dict[str, Any]:
 
 
 EnginePrompt = PromptType | ProcessorInputs
+
+
+def _optional_body_str(body: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = body.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value.strip():
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=f"'{key}' must be a non-empty string when provided.",
+            )
+        return value.strip()
+    return None
+
+
+def _default_lora_name_from_path(lora_path: str) -> str:
+    path = lora_path.rstrip("/").rstrip("\\")
+    return os.path.basename(path) or f"hidden-states-lora-{uuid.uuid4().hex}"
+
+
+def _raise_lora_error(error: ErrorResponse) -> Never:
+    raise HTTPException(
+        status_code=error.error.code,
+        detail=error.error.message,
+    )
+
+
+async def _resolve_hidden_states_lora(
+    raw_request: Request,
+    body: dict[str, Any],
+) -> LoRARequest | None:
+    """Resolve the adapter requested by a hidden-state endpoint."""
+    lora_path = _optional_body_str(body, "lora_path")
+    lora_name = _optional_body_str(body, "lora_name", "lora", "adapter_name")
+    model_name = _optional_body_str(body, "model")
+    serving_models = models(raw_request)
+
+    if lora_path is not None:
+        resolved_name = lora_name or model_name
+        if not resolved_name or serving_models.is_base_model(resolved_name):
+            resolved_name = _default_lora_name_from_path(lora_path)
+
+        loaded_lora = serving_models.lora_requests.get(resolved_name)
+        if loaded_lora is not None:
+            if loaded_lora.lora_path != lora_path:
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                    detail=(
+                        f"LoRA adapter '{resolved_name}' is already loaded from "
+                        f"'{loaded_lora.lora_path}', not '{lora_path}'. Use a "
+                        "different lora_name."
+                    ),
+                )
+            return loaded_lora
+
+        if not envs.VLLM_ALLOW_RUNTIME_LORA_UPDATING:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=(
+                    "Loading a LoRA from 'lora_path' requires "
+                    "VLLM_ALLOW_RUNTIME_LORA_UPDATING=True."
+                ),
+            )
+
+        load_result = await serving_models.load_lora_adapter(
+            LoadLoRAAdapterRequest(
+                lora_name=resolved_name,
+                lora_path=lora_path,
+            )
+        )
+        if isinstance(load_result, ErrorResponse):
+            # Another request may have loaded the same adapter while this one
+            # was waiting for the per-name lock.
+            loaded_lora = serving_models.lora_requests.get(resolved_name)
+            if loaded_lora is not None and loaded_lora.lora_path == lora_path:
+                return loaded_lora
+            _raise_lora_error(load_result)
+        return serving_models.lora_requests[resolved_name]
+
+    resolved_name = lora_name or model_name
+    if not resolved_name or serving_models.is_base_model(resolved_name):
+        return None
+
+    loaded_lora = serving_models.lora_requests.get(resolved_name)
+    if loaded_lora is not None:
+        return loaded_lora
+
+    if not envs.VLLM_ALLOW_RUNTIME_LORA_UPDATING:
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_FOUND.value,
+            detail=f"The model '{resolved_name}' does not exist.",
+        )
+
+    resolved_lora = await serving_models.resolve_lora(resolved_name)
+    if isinstance(resolved_lora, ErrorResponse):
+        _raise_lora_error(resolved_lora)
+    return resolved_lora
 
 
 def _render_messages(raw_request: Request, body: dict[str, Any]) -> EnginePrompt:
@@ -168,6 +273,7 @@ def _prepare_engine_prompt(raw_request: Request, body: dict[str, Any]) -> Engine
 async def _run_hidden_state_request(
     client: EngineClient,
     prompt: EnginePrompt,
+    lora_request: LoRARequest | None = None,
 ) -> list[float]:
     request_id = f"hs-{uuid.uuid4().hex}"
     final_output = None
@@ -175,6 +281,7 @@ async def _run_hidden_state_request(
         prompt,
         _hidden_state_sampling_params(),
         request_id,
+        lora_request=lora_request,
     ):
         final_output = output
 
@@ -215,7 +322,8 @@ async def get_hidden_states(raw_request: Request):
     body = await raw_request.json()
     client = _engine_client(raw_request)
     prompt = _prepare_engine_prompt(raw_request, body)
-    hidden_state = await _run_hidden_state_request(client, prompt)
+    lora_request = await _resolve_hidden_states_lora(raw_request, body)
+    hidden_state = await _run_hidden_state_request(client, prompt, lora_request)
     return JSONResponse(content={"hidden_states": hidden_state})
 
 
@@ -232,15 +340,20 @@ async def get_hidden_states_batch(raw_request: Request):
         return JSONResponse(content={"hidden_states": []})
 
     client = _engine_client(raw_request)
+    lora_request = await _resolve_hidden_states_lora(raw_request, body)
     prompts = []
     for item in raw_prompts:
-        item_body = {**body, **item} if isinstance(item, dict) else {
-            **body,
-            "prompt": item,
-        }
+        item_body = (
+            {**body, **item}
+            if isinstance(item, dict)
+            else {
+                **body,
+                "prompt": item,
+            }
+        )
         item_body.pop("prompts", None)
         prompts.append(_prepare_engine_prompt(raw_request, item_body))
     hidden_states = await asyncio.gather(
-        *[_run_hidden_state_request(client, prompt) for prompt in prompts]
+        *[_run_hidden_state_request(client, prompt, lora_request) for prompt in prompts]
     )
     return JSONResponse(content={"hidden_states": hidden_states})

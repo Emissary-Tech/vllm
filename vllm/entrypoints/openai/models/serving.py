@@ -187,6 +187,11 @@ class OpenAIServingModels:
             try:
                 await self.engine_client.add_lora(lora_request)
             except Exception as e:
+                logger.exception(
+                    "Failed to load LoRA adapter: name '%s', path '%s'",
+                    lora_name,
+                    lora_path,
+                )
                 if str(
                     LoRAAdapterNotFoundError(
                         lora_request.lora_name, lora_request.lora_path

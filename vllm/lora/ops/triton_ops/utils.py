@@ -299,6 +299,11 @@ def get_lora_op_configs(
         )
 
     assert config_data is not None
+    if op_type == "shrink" and config_data["split_k"] != 1:
+        # Split-K accumulation uses atomics and makes classifier probabilities
+        # vary with request batching. Keep the tuned block sizes, but force a
+        # deterministic accumulation order for standard LoRA shrink kernels.
+        config_data = {**config_data, "split_k": 1}
     return config_data
 
 

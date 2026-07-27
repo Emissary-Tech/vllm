@@ -16,6 +16,25 @@ from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
 logger = init_logger(__name__)
 
 
+def _flatten_string_list(value: object) -> object:
+    if value is None or isinstance(value, str):
+        return value
+    if not isinstance(value, list):
+        return value
+
+    flattened: list[str] = []
+
+    def walk(items: list[object]) -> None:
+        for item in items:
+            if isinstance(item, list):
+                walk(item)
+            elif item is not None:
+                flattened.append(str(item))
+
+    walk(value)
+    return flattened
+
+
 @dataclass
 class PEFTHelper:
     """
@@ -85,6 +104,9 @@ class PEFTHelper:
 
         # Filter out fields that aren't defined in the class
         filtered_dict = {k: v for k, v in config_dict.items() if k in class_fields}
+        for key in ("target_modules", "modules_to_save"):
+            if key in filtered_dict:
+                filtered_dict[key] = _flatten_string_list(filtered_dict[key])
         return cls(**filtered_dict)
 
     @classmethod

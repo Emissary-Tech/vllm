@@ -20,7 +20,7 @@ ERROR_CASES = [
     (
         "test_modules_to_save",
         {"modules_to_save": ["lm_head"]},
-        "only supports modules_to_save being None",
+        "only supports modules_to_save for sequence classification heads",
     ),
 ]
 
@@ -68,6 +68,23 @@ def test_peft_helper_pass(llama32_lora_files, tmp_path):
     peft_helper.validate_legal(lora_config)
     scaling = peft_helper.lora_alpha / math.sqrt(peft_helper.r)
     assert abs(peft_helper.vllm_lora_scaling_factor - scaling) < 1e-3
+
+
+def test_peft_helper_flattens_classification_module_lists():
+    peft_helper = PEFTHelper.from_dict(
+        {
+            "r": 8,
+            "lora_alpha": 16,
+            "target_modules": [["q_proj"], ["k_proj", ["v_proj"]]],
+            "modules_to_save": [["score"]],
+        }
+    )
+
+    assert peft_helper.target_modules == ["q_proj", "k_proj", "v_proj"]
+    assert peft_helper.modules_to_save == ["score"]
+    peft_helper.validate_legal(
+        LoRAConfig(max_lora_rank=16, max_cpu_loras=2, max_loras=1)
+    )
 
 
 @pytest.mark.parametrize("test_name,config_change,expected_error", ERROR_CASES)
