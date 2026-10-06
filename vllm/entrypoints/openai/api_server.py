@@ -1279,11 +1279,15 @@ async def get_hidden_states(raw_request: Request):
     lora_request = await _resolve_hidden_states_lora(raw_request, body)
 
     # Generate 1 token to trigger forward pass → hidden states cached
-    async for output in client.generate(prompt,
-                                        sampling_params,
-                                        request_id,
-                                        lora_request=lora_request):
-        final_output = output  # noqa: F841
+    try:
+        async for output in client.generate(prompt,
+                                            sampling_params,
+                                            request_id,
+                                            lora_request=lora_request):
+            final_output = output  # noqa: F841
+    except ValueError as exc:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value,
+                            detail=str(exc)) from exc
 
     # Read cached hidden states
     hidden_states = await client.get_hidden_states(request_id)
@@ -1342,7 +1346,11 @@ async def get_hidden_states_batch(raw_request: Request):
             pass
         return await client.get_hidden_states(request_id)
 
-    results = await asyncio.gather(*[_one(p) for p in prompts])
+    try:
+        results = await asyncio.gather(*[_one(p) for p in prompts])
+    except ValueError as exc:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value,
+                            detail=str(exc)) from exc
     for i, h in enumerate(results):
         if h is None:
             raise HTTPException(
