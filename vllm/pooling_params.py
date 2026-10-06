@@ -15,11 +15,19 @@ class PoolingParams(
         additional_data: Any additional data needed for pooling.
     """
     additional_data: Optional[Any] = None
+    # Return the last backbone token before classification-head transforms.
+    return_hidden_states: bool = False
 
     def clone(self) -> "PoolingParams":
         """Returns a deep copy of the PoolingParams instance."""
-        return PoolingParams(additional_data=self.additional_data)
+        return PoolingParams(
+            additional_data=self.additional_data,
+            return_hidden_states=self.return_hidden_states,
+        )
 
     def __repr__(self) -> str:
-        return (f"PoolingParams("
-                f"additional_metadata={self.additional_data})")
+        return (
+            f"PoolingParams("
+            f"additional_metadata={self.additional_data}, "
+            f"return_hidden_states={self.return_hidden_states})"
+        )

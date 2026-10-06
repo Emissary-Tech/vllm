@@ -71,11 +71,18 @@ from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
 # yapf: enable
 from vllm.entrypoints.openai.protocol_classify import (ClassifyRequest,
                                                       ClassifyResponse)
+from vllm.entrypoints.openai.protocol_hidden_states import (
+    HiddenStatesBatchRequest,
+    HiddenStatesRequest,
+)
 from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
 from vllm.entrypoints.openai.serving_classify import OpenAIServingClassify
 from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
 from vllm.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
 from vllm.entrypoints.openai.serving_engine import OpenAIServing
+from vllm.entrypoints.openai.serving_hidden_states import (
+    OpenAIServingHiddenStates,
+)
 from vllm.entrypoints.openai.serving_models import (BaseModelPath,
                                                     OpenAIServingModels)
 from vllm.entrypoints.openai.serving_pooling import OpenAIServingPooling
@@ -577,6 +584,42 @@ async def create_classify(
         logger.exception("Error in create_classify")
         return base(raw_request).create_error_response(str(e))
 
+
+async def _create_hidden_states_response(request, raw_request):
+    handler = raw_request.app.state.openai_serving_hidden_states
+    if handler is None:
+        result = base(raw_request).create_error_response(
+            "Hidden states require --task=classify"
+        )
+    else:
+        result = await handler.create_hidden_states(request, raw_request)
+    if isinstance(result, ErrorResponse):
+        return JSONResponse(
+            content=result.model_dump(), status_code=result.code
+        )
+    return JSONResponse(content=result.model_dump())
+
+
+@router.post("/v1/hidden_states", dependencies=[Depends(validate_json_request)])
+@with_cancellation
+@load_aware_call
+async def create_hidden_states(
+    request: HiddenStatesRequest, raw_request: Request
+):
+    return await _create_hidden_states_response(request, raw_request)
+
+
+@router.post(
+    "/v1/hidden_states_batch", dependencies=[Depends(validate_json_request)]
+)
+@with_cancellation
+@load_aware_call
+async def create_hidden_states_batch(
+    request: HiddenStatesBatchRequest, raw_request: Request
+):
+    return await _create_hidden_states_response(request, raw_request)
+
+
 @router.post("/pooling", dependencies=[Depends(validate_json_request)])
 @with_cancellation
 @load_aware_call
@@ -1041,18 +1084,9 @@ async def init_app_state(
 
     # Create serving classify
     openai_serving_classify = None
-    openai_serving_pooling = None
     if model_config.task == "classify":
         logger.info("Task type is classify")
         # Create serving classify
-        openai_serving_pooling = OpenAIServingPooling(
-            engine_client=engine_client,
-            model_config=model_config,
-            models=state.openai_serving_models,
-            request_logger=request_logger,
-            chat_template=resolved_chat_template,
-            chat_template_content_format=args.chat_template_content_format,
-        )
         openai_serving_classify = OpenAIServingClassify(
             engine_client=engine_client,
             model_config=model_config,
@@ -1061,9 +1095,20 @@ async def init_app_state(
             chat_template=resolved_chat_template,
             chat_template_content_format=args.chat_template_content_format,
         )
-    
-    state.openai_serving_classify = openai_serving_classify
 
+    state.openai_serving_classify = openai_serving_classify
+    state.openai_serving_hidden_states = (
+        OpenAIServingHiddenStates(
+            engine_client=engine_client,
+            model_config=model_config,
+            models=state.openai_serving_models,
+            request_logger=request_logger,
+            chat_template=resolved_chat_template,
+            chat_template_content_format=args.chat_template_content_format,
+        )
+        if model_config.task == "classify"
+        else None
+    )
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0

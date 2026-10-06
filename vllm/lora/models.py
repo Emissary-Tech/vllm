@@ -29,6 +29,10 @@ from vllm.lora.utils import (from_layer, from_layer_logits_processor,
                              get_supported_lora_modules,
                              is_regex_target_modules,
                              parse_fine_tuned_lora_name, replace_submodule)
+from vllm.model_executor.layers.classification_head import (
+    REGRESSION_V_BASE_KEY,
+    ClassificationHead,
+)
 from vllm.model_executor.models import SupportsLoRA, supports_multimodal
 from vllm.model_executor.models.interfaces import is_pooling_model
 from vllm.model_executor.models.module_mapping import MultiModelKeys
@@ -38,7 +42,6 @@ from vllm.utils import is_pin_memory_available
 logger = init_logger(__name__)
 
 _GLOBAL_LORA_ID = 0
-REGRESSION_V_BASE_KEY = "base_model.model.regression.v_base"
 
 
 @dataclass
@@ -57,57 +60,6 @@ def get_lora_id():
     global _GLOBAL_LORA_ID
     _GLOBAL_LORA_ID += 1
     return _GLOBAL_LORA_ID
-
-import torch
-from vllm.model_executor.models.adapters import as_classification_model
-
-def _replace_classification_head(base_model, num_labels, hidden_size, device, dtype=None):
-    """
-    Completely replace the classification head with a new one.
-    
-    Args:
-        base_model: The model to attach the classification head to
-        num_labels: Number of output labels for the classification head
-        hidden_size: Hidden dimension size for the classification head
-        device: Device to place the new classification head on
-        dtype: Data type for the classification head (defaults to model's dtype)
-    
-    Returns:
-        The newly created classification head
-    """
-    # Get model's default dtype if not specified
-    if dtype is None:
-        dtype = next(base_model.parameters()).dtype
-    
-    logger.info(f"Creating new classification head with {num_labels} labels, "
-                f"hidden_size={hidden_size}, device={device}, dtype={dtype}")
-    
-    # Import here to avoid circular imports
-    from vllm.model_executor.layers.linear import RowParallelLinear
-    
-    # Create new classification head
-    new_head = RowParallelLinear(
-        hidden_size, 
-        num_labels, 
-        bias=True, 
-        prefix=""
-    ).to(device=device, dtype=dtype)
-    
-    # Initialize weights properly
-    with torch.no_grad():
-        # Use appropriate initialization based on model type
-        torch.nn.init.normal_(new_head.weight, mean=0.0, std=0.02)
-        if hasattr(new_head, 'bias') and new_head.bias is not None:
-            torch.nn.init.zeros_(new_head.bias)
-    
-    # Replace the head
-    base_model.score = new_head
-    
-    # Update config if available
-    if hasattr(base_model, "config"):
-        base_model.config.num_labels = num_labels
-        
-    return new_head
 
 
 def _is_head_only_adapter(peft_helper: PEFTHelper,
@@ -133,110 +85,6 @@ def _is_head_only_adapter(peft_helper: PEFTHelper,
     return has_head_weight
 
 
-def _head_output_size(tensors: dict[str, torch.Tensor]) -> Optional[int]:
-    for key, tensor in tensors.items():
-        if key.endswith(("score.weight", "classifier.weight")):
-            return tensor.shape[0]
-    return None
-
-
-def _attach_classification_head(base_model, tensors: dict,
-                                peft_helper: PEFTHelper):
-    """
-    Attach a classification head to base_model using weights from tensors.
-
-    This improved implementation ensures proper cache clearing and complete
-    replacement of classification heads when switching between adapters.
-    
-    Args:
-        base_model: The model to attach the classification head to
-        tensors: Dictionary of tensor weights from the adapter
-    """
-    if base_model is None:
-        return
-    
-    # Find classification weight and bias in tensors
-    weight_key = None
-    bias_key = None
-    regression_v_base = tensors.get(REGRESSION_V_BASE_KEY)
-    for key in tensors:
-        if key.endswith("score.weight") or key.endswith("classifier.weight"):
-            weight_key = key
-        if key.endswith("score.bias") or key.endswith("classifier.bias"):
-            bias_key = key
-    
-    if weight_key is None:
-        logger.info("No classification head found in adapter tensors")
-        return  # No classification head in this adapter
-
-    # Infer number of labels from weight shape
-    num_labels = tensors[weight_key].shape[0]
-    hidden_size = tensors[weight_key].shape[1]
-
-    # Get device and dtype from the base model
-    device = next(base_model.parameters()).device
-    dtype = next(base_model.parameters()).dtype
-    
-    logger.info(f"Found classification head with {num_labels} labels in adapter")
-    logger.info(f"Base model device: {device}, dtype: {dtype}")
-    
-    # Store original class for potential restoration
-    original_class = base_model.__class__
-    
-    # If the model doesn't already have a 'score' attribute, convert it to a classification model
-    if not hasattr(base_model, "score"):
-        # Transform the model class to a classification variant
-        logger.info(f"Transforming to classification model: {original_class}")
-        from vllm.model_executor.models.adapters import as_classification_model
-        base_model.__class__ = as_classification_model(original_class)
-        
-        # Create new classification head
-        _replace_classification_head(base_model, num_labels, hidden_size, device, dtype)
-    else:
-        # Always replace the classification head completely when switching adapters
-        logger.info(f"Replacing existing classification head")
-        _replace_classification_head(base_model, num_labels, hidden_size, device, dtype)
-
-    # Load weights into the score layer
-    with torch.no_grad():
-        # Convert tensors to the right device and dtype
-        weight_tensor = tensors[weight_key].to(device=device, dtype=dtype)
-        
-        # Verify shapes match before copying
-        if weight_tensor.shape != base_model.score.weight.shape:
-            raise ValueError(
-                f"Classification weight shape mismatch: adapter has {weight_tensor.shape}, "
-                f"but model has {base_model.score.weight.shape}"
-            )
-        
-        # Copy weights
-        base_model.score.weight.copy_(weight_tensor)
-        
-        # Handle bias if present
-        if bias_key:
-            bias_tensor = tensors[bias_key].to(device=device, dtype=dtype)
-            if hasattr(base_model.score, 'bias') and base_model.score.bias is not None:
-                if bias_tensor.shape != base_model.score.bias.shape:
-                    raise ValueError(
-                        f"Classification bias shape mismatch: adapter has {bias_tensor.shape}, "
-                        f"but model has {base_model.score.bias.shape}"
-                    )
-                base_model.score.bias.copy_(bias_tensor)
-            else:
-                logger.warning(f"Bias key {bias_key} found in adapter but model has no bias")
-
-    head_only = _is_head_only_adapter(peft_helper, tensors)
-    if regression_v_base is not None:
-        base_model.classification_head_regression_v_base = regression_v_base.to(
-            device=device, dtype=torch.float32)
-    else:
-        base_model.classification_head_regression_v_base = None
-    base_model.classification_head_use_cosine = (
-        regression_v_base is None and head_only
-        and (_head_output_size(tensors) or 0) > 1)
-    base_model.classification_head_temperature = 40.0
-    
-    logger.info(f"Successfully attached classification head with {num_labels} labels to the model")
 
 class LoRAModel(AdapterModel):
     """A LoRA fine-tuned model."""
@@ -247,6 +95,7 @@ class LoRAModel(AdapterModel):
         rank: int,
         loras: Dict[str, LoRALayerWeights],
         scaling_factor: Optional[float] = None,
+        classification_head: Optional[ClassificationHead] = None,
     ) -> None:
         """
         Args:
@@ -265,6 +114,7 @@ class LoRAModel(AdapterModel):
             > 0), f"a valid lora id should be greater than 0, got {self.id}"
         self.rank = rank
         self.loras: Dict[str, LoRALayerWeights] = loras
+        self.classification_head = classification_head
 
     def clone(self, lora_model_id: int) -> "LoRAModel":
         """Return a copy of the object with different ids.
@@ -274,6 +124,8 @@ class LoRAModel(AdapterModel):
             lora_model_id,
             rank=self.rank,
             loras=self.loras.copy(),
+            scaling_factor=self.scaling_factor,
+            classification_head=self.classification_head,
         )
 
     @property
@@ -311,7 +163,8 @@ class LoRAModel(AdapterModel):
                 continue
             module_name, is_lora_a, is_bias = parse_fine_tuned_lora_name(
                 tensor_name, weights_mapper)
-            if module_name in {"score", "classifier", "lm_head", "embed_tokens","model.embed_tokens"}:
+            if module_name in {"score", "classifier", "lm_head",
+                               "embed_tokens", "model.embed_tokens"}:
                 continue
             if module_name not in loras:
                 lora_embeddings_tensor = None
@@ -362,13 +215,20 @@ class LoRAModel(AdapterModel):
         for lora in loras.values():
             lora.optimize()
 
-        classification_keys = {"score", "classifier", "lm_head", "embed_tokens", "models.embed_tokens"}
-        loras = {module_name: weights for module_name, weights in loras.items() if module_name not in classification_keys}
+        classification_keys = {"score", "classifier", "lm_head",
+                               "embed_tokens", "models.embed_tokens"}
+        loras = {name: weights for name, weights in loras.items()
+                 if name not in classification_keys}
 
-        return cls(lora_model_id,
-                   peft_helper.r,
-                   loras,
-                   scaling_factor=peft_helper.vllm_long_context_scaling_factor)
+        return cls(
+            lora_model_id,
+            peft_helper.r,
+            loras,
+            scaling_factor=peft_helper.vllm_long_context_scaling_factor,
+            classification_head=ClassificationHead.from_tensors(
+                tensors, head_only=_is_head_only_adapter(peft_helper, tensors)
+            ),
+        )
 
     @classmethod
     def from_local_checkpoint(
@@ -427,8 +287,9 @@ class LoRAModel(AdapterModel):
                         lora_module, weights_mapper)
                     part_name = module_name.split(".")[-1]
                     if part_name not in expected_lora_modules:
-                        if part_name in {'score', 'classifier', 'lm_head', 'embed_tokens', 'model.embed_tokens'}:
-                            # These are modules from the modules_to_save; treat as expected.
+                        if part_name in {'score', 'classifier', 'lm_head',
+                                         'embed_tokens', 'model.embed_tokens'}:
+                            # Accept complete modules saved by PEFT.
                             continue
                         unexpected_modules.append(module_name)
                 if unexpected_modules:
@@ -470,8 +331,6 @@ class LoRAModel(AdapterModel):
                                  weights_only=True)
         else:
             raise ValueError(f"{lora_dir} doesn't contain tensors")
-
-        _attach_classification_head(model_cls, tensors, peft_helper)
 
         embeddings = None
         if os.path.isfile(new_embeddings_tensor_path):
@@ -555,6 +414,8 @@ class LoRAModelManager(AdapterModelManager):
         self.is_pooling_model = is_pooling_model(self.model)
         self.packed_modules: Dict[str, List[str]] = {}
         self.modules: Dict[str, BaseLayerWithLoRA] = {}
+        # GPU copies live only as long as their active adapter slots.
+        self._classification_heads: Dict[int, ClassificationHead] = {}
         # Dict instead of a Set for compatibility with LRUCache.
         self._last_mapping: Optional[LoRAMapping] = None
         self._create_lora_modules()
@@ -580,11 +441,30 @@ class LoRAModelManager(AdapterModelManager):
         """Move LoRA into a GPU buffer to be used in the forward pass."""
         if lora_id in self._active_adapters:
             return False
+        lora_model = self._registered_adapters[lora_id]
+        head = lora_model.classification_head
+        if head is not None:
+            if not getattr(
+                self.model, "supports_classification_hidden_states", False
+            ):
+                raise ValueError(
+                    "Adapter-owned heads require a converted "
+                    "classification model"
+                )
+            if head.weight.shape[1] != self.model.score.weight.shape[1]:
+                raise ValueError(
+                    "Adapter head hidden size does not match the base model"
+                )
         first_free_slot = next(
             ((i, lora_id) for i, lora_id in enumerate(self.lora_index_to_id)
              if lora_id is None), None)
         if first_free_slot is None:
             raise ValueError("No free lora slots")
+        device_head = (
+            head.to(self.device, self.model.score.weight.dtype)
+            if head is not None
+            else None
+        )
         index, _ = first_free_slot
         self._active_adapters[lora_id] = None
         lora_model = self._registered_adapters[lora_id]
@@ -592,7 +472,8 @@ class LoRAModelManager(AdapterModelManager):
                      lora_model.id, index)
         self.lora_index_to_id[index] = lora_model.id
         for module_name, module in self.modules.items():
-            if module_name in {"score","classifier","lm_head", "embed_tokens", "model.embed_tokens"}:
+            if module_name in {"score", "classifier", "lm_head",
+                               "embed_tokens", "model.embed_tokens"}:
                 continue
             module_lora = self._get_lora_layer_weights(lora_model, module_name)
             if module_lora:
@@ -612,9 +493,12 @@ class LoRAModelManager(AdapterModelManager):
                                 module_lora.bias)
             else:
                 module.reset_lora(index)
+        if device_head is not None:
+            self._classification_heads[lora_id] = device_head
         return True
 
     def _deactivate_adapter(self, lora_id: int):
+        self._classification_heads.pop(lora_id, None)
         try:
             index = self.lora_index_to_id.index(lora_id)
             self.lora_index_to_id[index] = None
@@ -663,10 +547,28 @@ class LoRAModelManager(AdapterModelManager):
         self._registered_adapters.clear()
         self.lora_index_to_id = [None] * self.lora_slots
         self._active_adapters.clear()
+        self._classification_heads.clear()
+
+    def get_classification_head(
+        self, lora_id: int
+    ) -> Optional[ClassificationHead]:
+        """Resolve only this request's adapter head."""
+        if lora_id not in self._active_adapters:
+            raise ValueError(f"Classification adapter {lora_id} is not active")
+        return self._classification_heads.get(lora_id)
 
     def _create_lora_modules(self):
         for module_name, module in self.model.named_modules(
                 remove_duplicate=False):
+            if (
+                getattr(
+                    self.model, "supports_classification_hidden_states", False
+                )
+                and module_name == "score"
+            ):
+                # Complete heads are owned by adapters, not low-rank token
+                # projections. Pooling also has fewer rows than LoRAMapping.
+                continue
             if isinstance(module, PPMissingLayer):
                 continue
             if not self._match_target_modules(module_name):

@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Any, Optional, TypeVar
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from .interfaces_base import VllmModelForPooling, is_pooling_model
 
@@ -163,7 +162,7 @@ def as_classification_model(cls: _T) -> _T:
 
     # Lazy import
     from vllm.config import VllmConfig
-    from vllm.model_executor.layers.linear import RowParallelLinear
+    from vllm.model_executor.layers.linear import ReplicatedLinear
     from vllm.model_executor.layers.pooler import PoolingType
     from vllm.sequence import IntermediateTensors
 
@@ -177,6 +176,7 @@ def as_classification_model(cls: _T) -> _T:
     )
 
     class ModelForClassification(ModelForPooling):
+        supports_classification_hidden_states = True
 
         def __init__(
             self,
@@ -190,13 +190,15 @@ def as_classification_model(cls: _T) -> _T:
             config = vllm_config.model_config.hf_config
             quant_config = vllm_config.quant_config
 
-            self.score = RowParallelLinear(config.hidden_size,
-                                           config.num_labels,
-                                           quant_config=quant_config,
-                                           input_is_parallel=False,
-                                           bias=False,
-                                           prefix=maybe_prefix(
-                                               prefix, "score"))
+            # Pooling runs on the driver rank. A replicated head avoids a
+            # tensor-parallel collective after the other ranks have returned.
+            self.score = ReplicatedLinear(
+                config.hidden_size,
+                config.num_labels,
+                quant_config=quant_config,
+                bias=False,
+                prefix=maybe_prefix(prefix, "score"),
+            )
 
         def forward(
             self,
@@ -205,28 +207,97 @@ def as_classification_model(cls: _T) -> _T:
             intermediate_tensors: Optional[IntermediateTensors] = None,
             inputs_embeds: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
-            hidden_states = super().forward(input_ids, positions,
-                                            intermediate_tensors,
-                                            inputs_embeds)
-            regression_v_base = getattr(self,
-                                        "classification_head_regression_v_base",
-                                        None)
-            if regression_v_base is not None:
-                regression_v_base = regression_v_base.to(
-                    device=hidden_states.device, dtype=torch.float32)
-                hidden_states = F.normalize(hidden_states.float() -
-                                            regression_v_base,
-                                            dim=-1).to(self.score.weight.dtype)
-                logits, _ = self.score(hidden_states)
-                return logits
-            if getattr(self, "classification_head_use_cosine", False):
-                tau = getattr(self, "classification_head_temperature", 40.0)
-                hidden_states = F.normalize(hidden_states.float(), dim=-1)
-                weight = F.normalize(self.score.weight.float(), dim=-1)
-                return tau * F.linear(hidden_states, weight)
+            # Keep the backbone output intact. Request/adapter metadata is
+            # available in pooler(), where each request selects its own head.
+            return super().forward(
+                input_ids, positions, intermediate_tensors, inputs_embeds
+            )
+
+        def _classification_head(self, lora_id):
+            manager = getattr(self, "lora_manager", None)
+            if manager is None:
+                raise ValueError(
+                    "Classification adapter requested without a LoRA manager"
+                )
+            return manager.get_classification_head(lora_id)
+
+        def _base_score(self, hidden_states):
             logits, _ = self.score(hidden_states)
             return logits
 
+        def pooler(self, hidden_states, pooling_metadata):
+            from vllm.model_executor.layers.classification_head import (
+                classify_rows,
+            )
+            from vllm.model_executor.layers.pooler import LastPool
+            from vllm.model_executor.pooling_metadata import PoolingMetadata
+            from vllm.sequence import PoolerOutput, PoolingSequenceGroupOutput
+
+            groups = pooling_metadata.seq_groups
+            lora_ids = pooling_metadata.lora_ids
+            if (
+                len(groups) != len(pooling_metadata.prompt_lens)
+                or len(groups) != len(lora_ids)
+                or any(len(seq_ids) != 1 for seq_ids, _ in groups)
+            ):
+                raise ValueError(
+                    "Expected one sequence per classification request"
+                )
+            raw = [params.return_hidden_states for _, params in groups]
+
+            if isinstance(self._pooler, LastPool):
+                # Projection only needs the last token, not every prompt token.
+                features = self._pooler.extract_states(
+                    hidden_states, pooling_metadata
+                )
+                rows = classify_rows(
+                    features,
+                    lora_ids,
+                    raw,
+                    self._classification_head,
+                    self._base_score,
+                )
+                return PoolerOutput(
+                    outputs=[
+                        PoolingSequenceGroupOutput(
+                            row
+                            if is_raw
+                            else self._pooler.head(row.unsqueeze(0)).squeeze(0)
+                        )
+                        for row, is_raw in zip(rows, raw)
+                    ]
+                )
+
+            # Preserve custom pooling behavior: project tokens before pooling.
+            outputs = []
+            offset = 0
+            for (seq_ids, params), length, lora_id in zip(
+                groups, pooling_metadata.prompt_lens, lora_ids
+            ):
+                features = hidden_states[offset : offset + length]
+                offset += length
+                if params.return_hidden_states:
+                    outputs.append(
+                        PoolingSequenceGroupOutput(features[-1].float())
+                    )
+                    continue
+                head = self._classification_head(lora_id) if lora_id else None
+                logits = (
+                    head(features)
+                    if head is not None
+                    else self._base_score(features)
+                )
+                metadata = PoolingMetadata(
+                    [(seq_ids, params)],
+                    {
+                        seq_id: pooling_metadata.seq_data[seq_id]
+                        for seq_id in seq_ids
+                    },
+                    [length],
+                    [lora_id],
+                )
+                outputs.extend(self._pooler(logits, metadata).outputs)
+            return PoolerOutput(outputs=outputs)
 
     ModelForClassification.__name__ = \
         _get_pooling_model_name(cls.__name__, "ForClassification")

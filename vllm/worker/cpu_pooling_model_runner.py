@@ -117,6 +117,7 @@ class CPUPoolingModelRunner(
             seq_groups=seq_groups,
             seq_data=seq_data,
             prompt_lens=prompt_lens,
+            lora_ids=[group.lora_int_id for group in seq_group_metadata_list],
         )
 
         return pooling_metadata
